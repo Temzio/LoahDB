@@ -6,19 +6,31 @@
     <Nullable>enable</Nullable>
     <Title>LoahDB</Title>
     <Company>Temzio</Company>
-    <Version>0.1.2</Version>
+    <Version>0.2.0</Version>
     <Authors>SeyedAli Hoseini</Authors>
     <Description>This library helps you to save data in your dotnet apps.</Description>
     <PackageIcon>loahdb.png</PackageIcon>
     <PackageProjectUrl>temzio.ir/LoahDB</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Temzio/LoahDB</RepositoryUrl>
+    <ApplicationIcon>loahdb.ico</ApplicationIcon>
+    <PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+    <Content Include="loahdb.ico" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="LICENSE.txt">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
     <None Update="loahdb.png">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
