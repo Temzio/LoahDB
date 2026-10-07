@@ -101,6 +101,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
             }
 
             ApplySecondaryIndexInserts(inserted);
+            ApplyFullTextInserts(inserted);
             RebuildInMemoryIndexesIfNeeded();
         }
         catch
@@ -156,6 +157,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
             }
 
             ApplySecondaryIndexInsert(document);
+            ApplyFullTextInsert(document);
             RebuildInMemoryIndexesIfNeeded();
         }
         catch
@@ -234,6 +236,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
         }
 
         ApplySecondaryIndexUpdate(existing, document);
+        ApplyFullTextUpdate(existing, document);
         RebuildInMemoryIndexesIfNeeded();
         Persist();
         OnChanged(LoahChangeKind.Update, 1);
@@ -275,6 +278,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
         }
 
         ApplySecondaryIndexDelete(doc);
+        ApplyFullTextDelete(doc);
         _byId.Remove(documentId);
         RebuildInMemoryIndexesIfNeeded();
         Persist();
@@ -313,6 +317,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
         foreach (var doc in matches)
         {
             ApplySecondaryIndexDelete(doc);
+            ApplyFullTextDelete(doc);
         }
 
         RebuildInMemoryIndexesIfNeeded();
@@ -564,6 +569,52 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
         return results;
     }
 
+    /// <summary>Creates or rebuilds a simple full-text index on a string field.</summary>
+    public void EnsureFullTextIndex(string indexName, Expression<Func<T, string>> textSelector)
+    {
+        var path = ExpressionPath.GetMemberPath(textSelector);
+        var definition = _data.FullTextIndexDefinitions.FirstOrDefault(i =>
+            i.Name.Equals(indexName, StringComparison.OrdinalIgnoreCase));
+        if (definition is null)
+        {
+            definition = new LoahFullTextIndexDefinition();
+            _data.FullTextIndexDefinitions.Add(definition);
+        }
+
+        definition.Name = indexName;
+        definition.PropertyPath = path;
+        RebuildFullTextIndexes();
+        Persist();
+    }
+
+    /// <summary>Finds documents whose indexed text contains every query token (AND).</summary>
+    public IReadOnlyList<T> SearchFullText(string indexName, string query)
+    {
+        var tokens = LoahFullTextTokenizer.Tokenize(query).Distinct().ToList();
+        if (tokens.Count == 0)
+        {
+            return Array.Empty<T>();
+        }
+
+        if (!_data.FullTextIndexes.TryGetValue(indexName, out var lookup))
+        {
+            return Array.Empty<T>();
+        }
+
+        HashSet<string>? matches = null;
+        foreach (var token in tokens)
+        {
+            if (!lookup.TryGetValue(token, out var ids) || ids.Count == 0)
+            {
+                return Array.Empty<T>();
+            }
+
+            matches = matches is null ? ids.ToHashSet(StringComparer.Ordinal) : matches.Intersect(ids).ToHashSet(StringComparer.Ordinal);
+        }
+
+        return matches!.Select(id => GetById(id)).Where(d => d is not null).Select(d => d!).ToList();
+    }
+
     public void Reload()
     {
         if (_pageStore is not null)
@@ -574,6 +625,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
                 Name = _name,
                 IndexDefinitions = entry.IndexDefinitions,
                 Schema = entry.Schema,
+                FullTextIndexDefinitions = entry.FullTextIndexDefinitions,
             };
             _store.RegisterReferenceQueryable(this);
             _byId.Clear();
@@ -582,6 +634,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
             EnsureDefaultIdIndexDefinition();
             RegisterSecondaryIndexes();
             RebuildInMemoryIndexesIfNeeded();
+            RebuildFullTextIndexes();
             return;
         }
 
@@ -594,6 +647,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
         EnsureDefaultIdIndexDefinition();
         RebuildIdMap();
         RebuildJsonIndexes();
+        RebuildFullTextIndexes();
         _store.RegisterReferenceQueryable(this);
     }
 
@@ -606,6 +660,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
             entry.IndexDefinitions = _data.IndexDefinitions;
             entry.RootPageId = _treeRootPageId;
             entry.Schema = _data.Schema;
+            entry.FullTextIndexDefinitions = _data.FullTextIndexDefinitions;
             _pageStore.SaveCatalogEntry(_name, entry);
             return;
         }
@@ -696,6 +751,101 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenc
         }
 
         RebuildJsonIndexes();
+    }
+
+    private void RebuildFullTextIndexes()
+    {
+        _data.FullTextIndexes.Clear();
+        foreach (var definition in _data.FullTextIndexDefinitions)
+        {
+            var lookup = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (var doc in EnumerateDocuments())
+            {
+                AddDocumentToFullTextLookup(lookup, definition, doc);
+            }
+
+            _data.FullTextIndexes[definition.Name] = lookup;
+        }
+    }
+
+    private void ApplyFullTextInsert(T document) => ApplyFullTextInserts(new[] { document });
+
+    private void ApplyFullTextInserts(IEnumerable<T> documents)
+    {
+        foreach (var definition in _data.FullTextIndexDefinitions)
+        {
+            if (!_data.FullTextIndexes.TryGetValue(definition.Name, out var lookup))
+            {
+                lookup = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+                _data.FullTextIndexes[definition.Name] = lookup;
+            }
+
+            foreach (var document in documents)
+            {
+                AddDocumentToFullTextLookup(lookup, definition, document);
+            }
+        }
+    }
+
+    private void ApplyFullTextUpdate(T previous, T current)
+    {
+        ApplyFullTextDelete(previous);
+        ApplyFullTextInsert(current);
+    }
+
+    private void ApplyFullTextDelete(T document)
+    {
+        foreach (var definition in _data.FullTextIndexDefinitions)
+        {
+            if (!_data.FullTextIndexes.TryGetValue(definition.Name, out var lookup))
+            {
+                continue;
+            }
+
+            RemoveDocumentFromFullTextLookup(lookup, definition, document);
+        }
+    }
+
+    private static void AddDocumentToFullTextLookup(
+        Dictionary<string, List<string>> lookup,
+        LoahFullTextIndexDefinition definition,
+        T document)
+    {
+        var text = IndexValueExtractor.GetPropertyValue(document, definition.PropertyPath)?.ToString();
+        foreach (var token in LoahFullTextTokenizer.Tokenize(text))
+        {
+            if (!lookup.TryGetValue(token, out var ids))
+            {
+                ids = new List<string>();
+                lookup[token] = ids;
+            }
+
+            if (!ids.Contains(document.Id))
+            {
+                ids.Add(document.Id);
+            }
+        }
+    }
+
+    private static void RemoveDocumentFromFullTextLookup(
+        Dictionary<string, List<string>> lookup,
+        LoahFullTextIndexDefinition definition,
+        T document)
+    {
+        var text = IndexValueExtractor.GetPropertyValue(document, definition.PropertyPath)?.ToString();
+        foreach (var token in LoahFullTextTokenizer.Tokenize(text))
+        {
+            if (!lookup.TryGetValue(token, out var ids))
+            {
+                continue;
+            }
+
+            ids.Remove(document.Id);
+            if (ids.Count == 0)
+            {
+                lookup.Remove(token);
+            }
+        }
     }
 
     private void RebuildJsonIndexes()

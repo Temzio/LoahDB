@@ -28,7 +28,12 @@ public class DocumentStoreBenchmarks
         _loahRoot = Path.Combine(baseDir, "loah");
         _sqlitePath = Path.Combine(baseDir, "bench.sqlite");
         _liteDbPath = Path.Combine(baseDir, "bench.litedb");
-        _loahOptions = new LoahOptions { BasePath = baseDir, AtomicWrites = true };
+        _loahOptions = new LoahOptions
+        {
+            BasePath = baseDir,
+            AtomicWrites = true,
+            StorageFormat = LoahStorageFormat.PageFile,
+        };
         _seed = Enumerable.Range(0, DocumentCount)
             .Select(i => new BenchmarkDocument
             {

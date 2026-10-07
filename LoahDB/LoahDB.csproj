@@ -6,9 +6,13 @@
     <Nullable>enable</Nullable>
     <Title>LoahDB</Title>
     <Company>Temzio</Company>
-    <Version>1.0.0</Version>
+    <Version>2.0.0</Version>
+    <PackageId>LoahDB</PackageId>
+    <IsPackable>true</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <Authors>SeyedAli Hoseini</Authors>
-    <Description>Embedded JSON document database for .NET — collections, queries, indexes, transactions, and encryption.</Description>
+    <Description>Embedded JSON document database for .NET — page-file storage, WAL, indexes, query planner, schema, and AES-GCM encryption.</Description>
     <PackageIcon>loahdb.png</PackageIcon>
     <PackageProjectUrl>temzio.ir/LoahDB</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Temzio/LoahDB</RepositoryUrl>
@@ -35,6 +39,7 @@
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>
