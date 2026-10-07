@@ -27,7 +27,7 @@ internal static class LegacyV1Importer
 
             if (!string.IsNullOrEmpty(options.EncryptionKey))
             {
-                json = CryptoLoah.Decrypt(json, options.EncryptionKey);
+                json = LoahAuthenticatedCrypto.DecryptString(json, options.EncryptionKey, options.KeyDerivationIterations);
             }
 
             var root = JObject.Parse(json);

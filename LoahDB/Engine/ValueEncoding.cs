@@ -7,6 +7,7 @@ internal static class ValueEncoding
 
     public static byte[] Encode(LoahPageDatabase db, byte[] value)
     {
+        value = db.ProtectPayload(value);
         if (value.Length <= LoahConstants.BTreeInlineValueMaxBytes)
         {
             var result = new byte[value.Length + 1];
@@ -31,15 +32,15 @@ internal static class ValueEncoding
 
         if (stored[0] == InlineTag)
         {
-            return stored.Slice(1).ToArray();
+            return db.UnprotectPayload(stored.Slice(1).ToArray());
         }
 
         if (stored[0] == OverflowTag && stored.Length >= 5)
         {
             var pageId = BitConverter.ToUInt32(stored.Slice(1, 4));
-            return db.ReadOverflowChain(pageId);
+            return db.UnprotectPayload(db.ReadOverflowChain(pageId));
         }
 
-        return stored.ToArray();
+        return db.UnprotectPayload(stored.ToArray());
     }
 }

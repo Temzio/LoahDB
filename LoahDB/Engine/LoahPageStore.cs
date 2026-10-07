@@ -16,7 +16,7 @@ internal sealed class LoahPageStore : IDisposable
 
     internal LoahPageStore(string filePath, LoahOptions options, Stream? walStreamOverride)
     {
-        _database = new LoahPageDatabase(filePath, options.PageCacheCapacity, walStreamOverride);
+        _database = new LoahPageDatabase(filePath, options, walStreamOverride);
         _jsonSettings = options.SerializerSettings;
         LoadCatalogCache();
     }
@@ -73,6 +73,12 @@ internal sealed class LoahPageStore : IDisposable
     public void CheckpointForBackup() => _database.CheckpointForBackup();
 
     public void Vacuum() => _database.Vacuum();
+
+    public void EnableEncryption(string passphrase) =>
+        _database.EnablePayloadEncryptionAndReencrypt(passphrase);
+
+    public void RotateEncryptionKey(string newEncryptionKey) =>
+        _database.RotatePayloadEncryptionKey(newEncryptionKey);
 
     public IReadOnlyCollection<string> CatalogCollectionNames => _catalogCache.Keys.ToList();
 

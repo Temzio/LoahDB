@@ -139,6 +139,42 @@ public sealed class LoahStore : IDisposable
     /// <summary>Rewrites the page-file database to drop free pages.</summary>
     public void Vacuum() => _pageStore?.Vacuum();
 
+    /// <summary>Encrypts all page-file payloads using <see cref="LoahOptions.EncryptionKey"/>.</summary>
+    public void EnableEncryption()
+    {
+        if (_pageStore is null)
+        {
+            throw new InvalidOperationException("EnableEncryption requires LoahStorageFormat.PageFile.");
+        }
+
+        if (string.IsNullOrEmpty(Options.EncryptionKey))
+        {
+            throw new LoahEncryptionException("Set LoahOptions.EncryptionKey before calling EnableEncryption.");
+        }
+
+        var meta = Storage.Read<LoahStoreMetadata>(_metadataPath) ?? new LoahStoreMetadata();
+        using var tx = BeginTransaction();
+        _pageStore.EnableEncryption(Options.EncryptionKey);
+        Storage.Write(_metadataPath, meta);
+        tx.Commit();
+    }
+
+    /// <summary>Re-encrypts the page-file database with a new passphrase.</summary>
+    public void RotateEncryptionKey(string newEncryptionKey)
+    {
+        if (_pageStore is null)
+        {
+            throw new InvalidOperationException("RotateEncryptionKey requires LoahStorageFormat.PageFile.");
+        }
+
+        var meta = Storage.Read<LoahStoreMetadata>(_metadataPath) ?? new LoahStoreMetadata();
+        using var tx = BeginTransaction();
+        _pageStore.RotateEncryptionKey(newEncryptionKey);
+        Options.EncryptionKey = newEncryptionKey;
+        Storage.Write(_metadataPath, meta);
+        tx.Commit();
+    }
+
     internal void RegisterReferenceQueryable(ILoahReferenceQueryable queryable) =>
         _referenceQueryables[queryable.CollectionName] = queryable;
 

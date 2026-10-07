@@ -18,6 +18,9 @@ public sealed class LoahOptions
     /// </summary>
     public string? EncryptionKey { get; set; }
 
+    /// <summary>PBKDF2 iteration count when deriving keys from <see cref="EncryptionKey"/>.</summary>
+    public int KeyDerivationIterations { get; set; } = 100_000;
+
     /// <summary>
     /// Newtonsoft.Json settings used for serialization.
     /// </summary>
@@ -57,6 +60,7 @@ public sealed class LoahOptions
     {
         BasePath = BasePath,
         EncryptionKey = EncryptionKey,
+        KeyDerivationIterations = KeyDerivationIterations,
         SerializerSettings = SerializerSettings,
         LockTimeout = LockTimeout,
         AtomicWrites = AtomicWrites,

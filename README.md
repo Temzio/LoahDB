@@ -96,11 +96,11 @@ Benchmarks use the current JSON-per-collection engine; later phases move to a pa
 | 2 | WAL + fsync, atomic store transactions, writer lock, crash recovery |
 | 3 | On-disk secondary B+Tree indexes (composite, nested, range, multikey) |
 | 4 | Expression query planner, `Explain()`, aggregates, `Join` |
-| **5** (current) | Collection schema, referential actions, `CheckIntegrity`, `Vacuum`, page-file backup |
-| 6 | Authenticated encryption (AES-GCM, KDF) |
+| 5 | Collection schema, referential actions, `CheckIntegrity`, `Vacuum`, page-file backup |
+| **6** (current) | PBKDF2 + AES-GCM payloads, legacy CBC read, `EnableEncryption`, `RotateEncryptionKey` |
 | 7 | CLI tool, packaging, optional FTS |
 
-Design notes: [ADR-0](docs/ADR-0-phase-0-baseline.md) … [ADR-5](docs/ADR-5-schema-integrity.md).
+Design notes: [ADR-0](docs/ADR-0-phase-0-baseline.md) … [ADR-6](docs/ADR-6-authenticated-encryption.md).
 
 ### Page-file store (Phase 1)
 
@@ -115,6 +115,10 @@ Secondary indexes on page-file stores use per-index B+Trees (`EnsureIndex`, `Ens
 ### Schema & integrity (Phase 5)
 
 `LoahCollection.SetSchema` enforces required fields, coarse types, and optional references (`Restrict`, `Cascade`, `SetNull` on parent delete). `LoahStore.CheckIntegrity()` validates the page file and loaded reference graphs. `Vacuum()` compacts the `.loahdb` file; `LoahBackup.Export` checkpoints the WAL and includes the page file in the zip.
+
+### Encryption (Phase 6)
+
+Set `LoahOptions.EncryptionKey` when creating a page-file store to encrypt catalog and document payloads (PBKDF2 + AES-GCM). JSON collection files use the `LOAH2:` authenticated format; legacy AES-CBC files still decrypt. Call `EnableEncryption()` to encrypt an existing plaintext page store, or `RotateEncryptionKey` to change the passphrase.
 
 ## License
 

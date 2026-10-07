@@ -8,6 +8,8 @@ internal static class LoahConstants
     public const int HeaderSaltOffset = 32;
     public const int HeaderSaltLength = 32;
     public const int HeaderCrcOffset = 64;
+    public const int HeaderEncryptionFlagsOffset = 68;
+    public const byte HeaderEncryptionPayloadFlag = 1;
     public const int BTreeMaxKeyBytes = 512;
     public const int BTreeInlineValueMaxBytes = 3500;
 }

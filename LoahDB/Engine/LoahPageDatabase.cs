@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using Newtonsoft.Json;
 
@@ -19,10 +20,20 @@ internal sealed class LoahPageDatabase : IDisposable
     private uint _freeListHead;
     private uint _catalogRoot;
     private int _schemaVersion;
+    private readonly LoahOptions _options;
+    private byte[] _headerSalt = new byte[LoahConstants.HeaderSaltLength];
+    private byte _encryptionFlags;
+    private byte[]? _dataEncryptionKey;
 
     public LoahPageDatabase(string filePath, int pageCacheCapacity, Stream? walStreamOverride = null)
+        : this(filePath, new LoahOptions { PageCacheCapacity = pageCacheCapacity }, walStreamOverride)
+    {
+    }
+
+    public LoahPageDatabase(string filePath, LoahOptions options, Stream? walStreamOverride = null)
     {
         _filePath = filePath;
+        _options = options;
         var directory = Path.GetDirectoryName(filePath);
         if (!string.IsNullOrEmpty(directory))
         {
@@ -31,7 +42,7 @@ internal sealed class LoahPageDatabase : IDisposable
 
         var exists = File.Exists(filePath);
         _stream = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        _cache = new PageCache(pageCacheCapacity, WritePageToDisk, CanEvictPage);
+        _cache = new PageCache(_options.PageCacheCapacity, WritePageToDisk, CanEvictPage);
         _wal = new WriteAheadLog(filePath + "-wal", walStreamOverride);
         if (!exists || _stream.Length == 0)
         {
@@ -42,6 +53,30 @@ internal sealed class LoahPageDatabase : IDisposable
             RecoverFromWal();
             LoadHeader();
         }
+
+        EnsureEncryptionKeyLoaded();
+    }
+
+    internal bool EncryptionEnabled => (_encryptionFlags & LoahConstants.HeaderEncryptionPayloadFlag) != 0;
+
+    internal byte[] ProtectPayload(byte[] value)
+    {
+        if (!EncryptionEnabled || _dataEncryptionKey is null)
+        {
+            return value;
+        }
+
+        return LoahAuthenticatedCrypto.EncryptPayload(value, _dataEncryptionKey);
+    }
+
+    internal byte[] UnprotectPayload(byte[] value)
+    {
+        if (!EncryptionEnabled || _dataEncryptionKey is null)
+        {
+            return value;
+        }
+
+        return LoahAuthenticatedCrypto.DecryptPayload(value, _dataEncryptionKey);
     }
 
     internal bool IsWriteBatchActive => _writeBatchDepth > 0;
@@ -365,6 +400,12 @@ internal sealed class LoahPageDatabase : IDisposable
         _pageCount = 1;
         _freeListHead = 0;
         _schemaVersion = 1;
+        if (!string.IsNullOrEmpty(_options.EncryptionKey))
+        {
+            RandomNumberGenerator.Fill(_headerSalt);
+            _encryptionFlags = LoahConstants.HeaderEncryptionPayloadFlag;
+        }
+
         _stream.SetLength(LoahConstants.PageSize);
         var header = GetPage(0);
         WriteHeaderToPage(header);
@@ -375,6 +416,7 @@ internal sealed class LoahPageDatabase : IDisposable
         MarkDirty(catalogRoot);
         WriteHeader();
         Flush();
+        EnsureEncryptionKeyLoaded();
     }
 
     private void LoadHeader()
@@ -385,6 +427,93 @@ internal sealed class LoahPageDatabase : IDisposable
         _freeListHead = BitConverter.ToUInt32(header.Data, 20);
         _catalogRoot = BitConverter.ToUInt32(header.Data, 24);
         _schemaVersion = BitConverter.ToInt32(header.Data, 28);
+        header.Data.AsSpan(LoahConstants.HeaderSaltOffset, LoahConstants.HeaderSaltLength).CopyTo(_headerSalt);
+        _encryptionFlags = header.Data[LoahConstants.HeaderEncryptionFlagsOffset];
+        _dataEncryptionKey = null;
+    }
+
+    private void EnsureEncryptionKeyLoaded()
+    {
+        if (!EncryptionEnabled)
+        {
+            return;
+        }
+
+        if (string.IsNullOrEmpty(_options.EncryptionKey))
+        {
+            throw new LoahEncryptionException(
+                "This database is encrypted. Set LoahOptions.EncryptionKey before opening the store.");
+        }
+
+        _dataEncryptionKey = LoahAuthenticatedCrypto.DeriveKey(
+            _options.EncryptionKey,
+            _headerSalt,
+            _options.KeyDerivationIterations);
+    }
+
+    internal void EnablePayloadEncryptionAndReencrypt(string passphrase) =>
+        ReencryptAllPayloads(passphrase, alreadyEncrypted: EncryptionEnabled);
+
+    internal void RotatePayloadEncryptionKey(string newPassphrase) =>
+        ReencryptAllPayloads(newPassphrase, alreadyEncrypted: false);
+
+    private void ReencryptAllPayloads(string passphrase, bool alreadyEncrypted)
+    {
+        if (alreadyEncrypted)
+        {
+            return;
+        }
+
+        if (string.IsNullOrEmpty(passphrase))
+        {
+            throw new LoahEncryptionException("Encryption passphrase is required.");
+        }
+
+        var catalog = OpenCatalog();
+        var catalogEntries = catalog.Scan()
+            .Select(pair => (pair.Key, Plain: ReadValue(pair.Value)))
+            .ToList();
+
+        var documents = new List<(string Collection, string DocId, byte[] Plain)>();
+        foreach (var (name, metaPlain) in catalogEntries)
+        {
+            var json = Encoding.UTF8.GetString(metaPlain);
+            var entry = JsonConvert.DeserializeObject<CollectionCatalogEntry>(json);
+            if (entry is null)
+            {
+                continue;
+            }
+
+            var tree = OpenTree(entry.RootPageId);
+            foreach (var (docId, stored) in tree.Scan())
+            {
+                documents.Add((name, docId, ReadValue(stored)));
+            }
+        }
+
+        RandomNumberGenerator.Fill(_headerSalt);
+        _encryptionFlags |= LoahConstants.HeaderEncryptionPayloadFlag;
+        _dataEncryptionKey = LoahAuthenticatedCrypto.DeriveKey(
+            passphrase,
+            _headerSalt,
+            _options.KeyDerivationIterations);
+        _options.EncryptionKey = passphrase;
+
+        foreach (var (name, plain) in catalogEntries)
+        {
+            catalog.Insert(name, plain);
+        }
+
+        foreach (var (collection, docId, plain) in documents)
+        {
+            var metaPlain = catalogEntries.First(c => c.Key == collection).Plain;
+            var entry = JsonConvert.DeserializeObject<CollectionCatalogEntry>(Encoding.UTF8.GetString(metaPlain))
+                        ?? new CollectionCatalogEntry();
+            OpenTree(entry.RootPageId).Insert(docId, plain);
+        }
+
+        WriteHeader();
+        Flush();
     }
 
     private void ValidateHeader(PageBuffer header)
@@ -424,6 +553,8 @@ internal sealed class LoahPageDatabase : IDisposable
         BitConverter.TryWriteBytes(destination.Slice(20, 4), _freeListHead);
         BitConverter.TryWriteBytes(destination.Slice(24, 4), _catalogRoot);
         BitConverter.TryWriteBytes(destination.Slice(28, 4), _schemaVersion);
+        _headerSalt.CopyTo(destination.Slice(LoahConstants.HeaderSaltOffset, LoahConstants.HeaderSaltLength));
+        destination[LoahConstants.HeaderEncryptionFlagsOffset] = _encryptionFlags;
         var crc = ComputeHeaderCrc(destination.Slice(0, LoahConstants.HeaderCrcOffset).ToArray());
         BitConverter.TryWriteBytes(destination.Slice(LoahConstants.HeaderCrcOffset, 4), crc);
     }
@@ -458,7 +589,7 @@ internal sealed class LoahPageDatabase : IDisposable
         var catalog = OpenCatalog();
         foreach (var (name, metaBytes) in catalog.Scan())
         {
-            var json = Encoding.UTF8.GetString(metaBytes);
+            var json = Encoding.UTF8.GetString(ReadValue(metaBytes));
             var entry = JsonConvert.DeserializeObject<CollectionCatalogEntry>(json);
             if (entry is null)
             {
@@ -466,9 +597,9 @@ internal sealed class LoahPageDatabase : IDisposable
             }
 
             var tree = OpenTree(entry.RootPageId);
-            foreach (var (docId, payload) in tree.Scan())
+            foreach (var (docId, stored) in tree.Scan())
             {
-                yield return (name, docId, payload);
+                yield return (name, docId, ReadValue(stored));
             }
         }
     }
