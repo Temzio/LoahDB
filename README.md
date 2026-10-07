@@ -91,8 +91,8 @@ Benchmarks use the current JSON-per-collection engine; later phases move to a pa
 
 | Phase | Focus |
 |-------|--------|
-| **0** (current) | Baseline bug fixes, BenchmarkDotNet harness |
-| 1 | Page-based single-file storage (`.loahdb`) |
+| 0 | Baseline bug fixes, BenchmarkDotNet harness |
+| **1** (current) | Page-based `.loahdb` store, B+Tree per collection, LRU page cache, `ImportLegacyV1` |
 | 2 | WAL, ACID transactions, multi-process concurrency |
 | 3 | Secondary B+Tree indexes |
 | 4 | LINQ query planner |

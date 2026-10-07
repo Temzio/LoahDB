@@ -10,6 +10,7 @@ public class LoahPhase0Should : IDisposable
         _options = new LoahOptions
         {
             BasePath = Path.Combine(Path.GetTempPath(), "LoahDBTests"),
+            StorageFormat = LoahStorageFormat.JsonCollections,
         };
     }
 

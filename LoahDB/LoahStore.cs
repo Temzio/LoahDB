@@ -1,22 +1,30 @@
 using System.Collections.Concurrent;
+using LoahDB.Engine;
 
 namespace LoahDB;
 
 /// <summary>
 /// Entry point for a multi-collection document database backed by JSON files.
 /// </summary>
-public sealed class LoahStore
+public sealed class LoahStore : IDisposable
 {
     internal const string DefaultIdIndexName = "_id";
     private readonly ConcurrentDictionary<string, object> _collections = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _metadataPath;
     private LoahTransaction? _activeTransaction;
+    private readonly LoahPageStore? _pageStore;
 
     public LoahStore(string root, LoahOptions? options = null)
     {
         Root = root;
         Options = options?.Clone() ?? new LoahOptions();
         Storage = new LoahStorage(Options);
+        if (Options.StorageFormat == LoahStorageFormat.PageFile)
+        {
+            var pagePath = Path.Combine(Options.BasePath, root + ".loahdb");
+            _pageStore = new LoahPageStore(pagePath, Options);
+        }
+
         _metadataPath = Storage.ResolvePath(root, "_meta");
         EnsureMetadata();
     }
@@ -24,7 +32,22 @@ public sealed class LoahStore
     public string Root { get; }
     public LoahOptions Options { get; }
     internal LoahStorage Storage { get; }
+    internal LoahPageStore? PageStore => _pageStore;
     internal bool HasActiveTransaction => _activeTransaction is not null;
+
+    /// <summary>
+    /// Imports legacy v1 JSON collection files from <c>{root}/_collections/*.loah</c> into the page-file store.
+    /// </summary>
+    public void ImportLegacyV1()
+    {
+        if (_pageStore is null)
+        {
+            throw new InvalidOperationException("ImportLegacyV1 requires LoahStorageFormat.PageFile.");
+        }
+
+        var collectionsDir = Path.Combine(Options.BasePath, Root, "_collections");
+        LegacyV1Importer.Import(_pageStore, collectionsDir, Options);
+    }
 
     public LoahCollection<T> Collection<T>(string name) where T : class, ILoahDocument
     {
@@ -116,6 +139,11 @@ public sealed class LoahStore
             meta.UpdatedAtUtc = DateTime.UtcNow;
             Storage.Write(_metadataPath, meta);
         }
+    }
+
+    public void Dispose()
+    {
+        _pageStore?.Dispose();
     }
 }
 
