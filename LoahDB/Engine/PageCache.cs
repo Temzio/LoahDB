@@ -4,14 +4,25 @@ internal sealed class PageCache
 {
     private readonly int _capacity;
     private readonly Action<PageBuffer>? _flushOnEvict;
+    private readonly Func<PageBuffer, bool>? _canEvict;
     private readonly Dictionary<uint, LinkedListNode<CacheEntry>> _map = new();
     private readonly LinkedList<CacheEntry> _lru = new();
     private readonly object _lock = new();
 
-    public PageCache(int capacity, Action<PageBuffer>? flushOnEvict = null)
+    public PageCache(int capacity, Action<PageBuffer>? flushOnEvict = null, Func<PageBuffer, bool>? canEvict = null)
     {
         _capacity = Math.Max(16, capacity);
         _flushOnEvict = flushOnEvict;
+        _canEvict = canEvict;
+    }
+
+    public void Clear()
+    {
+        lock (_lock)
+        {
+            _map.Clear();
+            _lru.Clear();
+        }
     }
 
     public PageBuffer GetOrAdd(uint pageId, Func<uint, PageBuffer> loader)
@@ -82,6 +93,11 @@ internal sealed class PageCache
             }
 
             var page = last.Value.Page;
+            if (_canEvict is not null && !_canEvict(page))
+            {
+                break;
+            }
+
             if (page.IsDirty)
             {
                 _flushOnEvict?.Invoke(page);

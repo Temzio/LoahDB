@@ -10,11 +10,22 @@ internal sealed class LoahPageStore : IDisposable
     private readonly Dictionary<string, CollectionCatalogEntry> _catalogCache = new(StringComparer.OrdinalIgnoreCase);
 
     public LoahPageStore(string filePath, LoahOptions options)
+        : this(filePath, options, walStreamOverride: null)
     {
-        _database = new LoahPageDatabase(filePath, options.PageCacheCapacity);
+    }
+
+    internal LoahPageStore(string filePath, LoahOptions options, Stream? walStreamOverride)
+    {
+        _database = new LoahPageDatabase(filePath, options.PageCacheCapacity, walStreamOverride);
         _jsonSettings = options.SerializerSettings;
         LoadCatalogCache();
     }
+
+    public void BeginTransaction(TimeSpan lockTimeout) => _database.BeginWriteTransaction(lockTimeout);
+
+    public void CommitTransaction() => _database.CommitWriteTransaction();
+
+    public void RollbackTransaction() => _database.RollbackWriteTransaction();
 
     public LoahPageDatabase Database => _database;
 

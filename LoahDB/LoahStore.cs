@@ -67,7 +67,16 @@ public sealed class LoahStore : IDisposable
         return (LoahCollection<T>)_collections[key];
     }
 
-    public LoahTransaction BeginTransaction() => _activeTransaction ??= new LoahTransaction(this);
+    public LoahTransaction BeginTransaction()
+    {
+        if (_activeTransaction is not null)
+        {
+            throw new InvalidOperationException("A transaction is already active on this store. Commit or roll back before starting another.");
+        }
+
+        _pageStore?.BeginTransaction(Options.LockTimeout);
+        return _activeTransaction = new LoahTransaction(this);
+    }
 
     /// <summary>Returns persisted metadata for this store (schema version, collection names).</summary>
     public LoahStoreInfo GetInfo()

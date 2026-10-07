@@ -100,7 +100,11 @@ Benchmarks use the current JSON-per-collection engine; later phases move to a pa
 | 6 | Authenticated encryption (AES-GCM, KDF) |
 | 7 | CLI tool, packaging, optional FTS |
 
-See [docs/ADR-0-phase-0-baseline.md](docs/ADR-0-phase-0-baseline.md) for Phase 0 design notes.
+Design notes: [ADR-0](docs/ADR-0-phase-0-baseline.md), [ADR-1](docs/ADR-1-page-storage.md).
+
+### Page-file store (Phase 1)
+
+New stores default to `LoahStorageFormat.PageFile` (`{BasePath}/{root}.loahdb`). JSON-per-collection layout remains available via `LoahStorageFormat.JsonCollections`. Import v1 data with `store.ImportLegacyV1()` after copying or creating `{root}/_collections/*.loah`.
 
 ## License
 

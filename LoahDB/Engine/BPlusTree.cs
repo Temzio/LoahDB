@@ -54,7 +54,7 @@ internal sealed class BPlusTree
             _rootPageId = newRoot;
         }
 
-        _db.Flush();
+        _db.CompleteModification();
     }
 
     public bool Delete(string key)
@@ -74,7 +74,7 @@ internal sealed class BPlusTree
         entries.RemoveAt(idx);
         BTreeRecords.TryWriteLeaf(leaf, entries);
         _db.MarkDirty(leafPageId);
-        _db.Flush();
+        _db.CompleteModification();
         return true;
     }
 

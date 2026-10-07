@@ -7,16 +7,21 @@ namespace LoahDB.Engine;
 /// </summary>
 internal sealed class LoahPageDatabase : IDisposable
 {
+    private readonly string _filePath;
     private readonly FileStream _stream;
     private readonly PageCache _cache;
+    private readonly WriteAheadLog _wal;
     private readonly object _writeLock = new();
+    private StoreWriterLock? _writerLock;
+    private int _writeBatchDepth;
     private uint _pageCount;
     private uint _freeListHead;
     private uint _catalogRoot;
     private int _schemaVersion;
 
-    public LoahPageDatabase(string filePath, int pageCacheCapacity)
+    public LoahPageDatabase(string filePath, int pageCacheCapacity, Stream? walStreamOverride = null)
     {
+        _filePath = filePath;
         var directory = Path.GetDirectoryName(filePath);
         if (!string.IsNullOrEmpty(directory))
         {
@@ -25,16 +30,20 @@ internal sealed class LoahPageDatabase : IDisposable
 
         var exists = File.Exists(filePath);
         _stream = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-        _cache = new PageCache(pageCacheCapacity, WritePageToDisk);
+        _cache = new PageCache(pageCacheCapacity, WritePageToDisk, CanEvictPage);
+        _wal = new WriteAheadLog(filePath + "-wal", walStreamOverride);
         if (!exists || _stream.Length == 0)
         {
             InitializeNewFile();
         }
         else
         {
+            RecoverFromWal();
             LoadHeader();
         }
     }
+
+    internal bool IsWriteBatchActive => _writeBatchDepth > 0;
 
     public int SchemaVersion => _schemaVersion;
 
@@ -112,8 +121,113 @@ internal sealed class LoahPageDatabase : IDisposable
         return pageIds[0];
     }
 
+    internal void CompleteModification()
+    {
+        if (_writeBatchDepth > 0)
+        {
+            return;
+        }
+
+        Flush();
+    }
+
+    internal void BeginWriteTransaction(TimeSpan lockTimeout)
+    {
+        if (_writeBatchDepth == 0)
+        {
+            _writerLock = StoreWriterLock.Acquire(_filePath, lockTimeout);
+        }
+
+        _writeBatchDepth++;
+    }
+
+    internal void CommitWriteTransaction()
+    {
+        if (_writeBatchDepth == 0)
+        {
+            throw new InvalidOperationException("No active page-store write transaction.");
+        }
+
+        _writeBatchDepth--;
+        if (_writeBatchDepth > 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var headerBytes = new byte[LoahConstants.PageSize];
+            WriteHeaderBytes(headerBytes);
+            var dirty = _cache.GetDirtyPages().Where(p => p.PageId != 0).ToList();
+
+            foreach (var page in dirty)
+            {
+                _wal.AppendPage(page.PageId, page.Data);
+            }
+
+            _wal.AppendHeader(headerBytes);
+            _wal.AppendCommit();
+            _wal.FlushToDisk();
+
+            ApplyWalReplay(new WalReplayResult(true,
+                dirty.ToDictionary(p => p.PageId, p => p.Data.ToArray()),
+                headerBytes));
+
+            _wal.AppendCheckpoint();
+
+            var cachedHeader = GetPage(0);
+            headerBytes.CopyTo(cachedHeader.Data, 0);
+            cachedHeader.IsDirty = false;
+            foreach (var page in dirty)
+            {
+                page.IsDirty = false;
+            }
+        }
+        catch
+        {
+            _cache.Clear();
+            LoadHeader();
+            throw;
+        }
+        finally
+        {
+            _writerLock?.Dispose();
+            _writerLock = null;
+        }
+    }
+
+    internal void RollbackWriteTransaction()
+    {
+        if (_writeBatchDepth == 0)
+        {
+            throw new InvalidOperationException("No active page-store write transaction.");
+        }
+
+        _writeBatchDepth--;
+        if (_writeBatchDepth > 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _cache.Clear();
+            LoadHeader();
+        }
+        finally
+        {
+            _writerLock?.Dispose();
+            _writerLock = null;
+        }
+    }
+
     internal void Flush()
     {
+        if (_writeBatchDepth > 0)
+        {
+            return;
+        }
+
         lock (_writeLock)
         {
             var headerBytes = new byte[LoahConstants.PageSize];
@@ -195,8 +309,50 @@ internal sealed class LoahPageDatabase : IDisposable
 
     public void Dispose()
     {
+        if (_writeBatchDepth > 0)
+        {
+            RollbackWriteTransaction();
+        }
+
         Flush();
+        _wal.Dispose();
         _stream.Dispose();
+    }
+
+    private bool CanEvictPage(PageBuffer page) => !(page.IsDirty && _writeBatchDepth > 0);
+
+    private void RecoverFromWal()
+    {
+        var replay = _wal.ReplayCommitted();
+        if (!replay.HasCommittedTransaction)
+        {
+            return;
+        }
+
+        ApplyWalReplay(replay);
+        _wal.AppendCheckpoint();
+    }
+
+    private void ApplyWalReplay(WalReplayResult replay)
+    {
+        lock (_writeLock)
+        {
+            foreach (var (pageId, bytes) in replay.Pages)
+            {
+                _stream.Seek(pageId * LoahConstants.PageSize, SeekOrigin.Begin);
+                _stream.Write(bytes, 0, bytes.Length);
+            }
+
+            if (replay.HeaderPage is not null)
+            {
+                _stream.Seek(0, SeekOrigin.Begin);
+                _stream.Write(replay.HeaderPage, 0, replay.HeaderPage.Length);
+            }
+
+            _stream.Flush(flushToDisk: true);
+        }
+
+        _cache.Clear();
     }
 
     private void InitializeNewFile()
