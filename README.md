@@ -92,7 +92,8 @@ Benchmarks use the current JSON-per-collection engine; later phases move to a pa
 | Phase | Focus |
 |-------|--------|
 | 0 | Baseline bug fixes, BenchmarkDotNet harness |
-| **1** (current) | Page-based `.loahdb` store, B+Tree per collection, LRU page cache, `ImportLegacyV1` |
+| 1 | Page-based `.loahdb` store, B+Tree per collection, LRU page cache, `ImportLegacyV1` |
+| **2** (current) | WAL + fsync, atomic store transactions, writer lock, crash recovery |
 | 2 | WAL, ACID transactions, multi-process concurrency |
 | 3 | Secondary B+Tree indexes |
 | 4 | LINQ query planner |
@@ -100,11 +101,13 @@ Benchmarks use the current JSON-per-collection engine; later phases move to a pa
 | 6 | Authenticated encryption (AES-GCM, KDF) |
 | 7 | CLI tool, packaging, optional FTS |
 
-Design notes: [ADR-0](docs/ADR-0-phase-0-baseline.md), [ADR-1](docs/ADR-1-page-storage.md).
+Design notes: [ADR-0](docs/ADR-0-phase-0-baseline.md), [ADR-1](docs/ADR-1-page-storage.md), [ADR-2](docs/ADR-2-wal-acid.md).
 
 ### Page-file store (Phase 1)
 
 New stores default to `LoahStorageFormat.PageFile` (`{BasePath}/{root}.loahdb`). JSON-per-collection layout remains available via `LoahStorageFormat.JsonCollections`. Import v1 data with `store.ImportLegacyV1()` after copying or creating `{root}/_collections/*.loah`.
+
+Page-file commits use a write-ahead log (`{root}.loahdb-wal`) with checksummed frames and recovery on open. `BeginTransaction()` stages work across collections; a second nested `BeginTransaction()` throws. Writer exclusivity uses `{root}.loahdb.writer.lock` (see `LoahOptions.LockTimeout`).
 
 ## License
 
