@@ -93,9 +93,8 @@ Benchmarks use the current JSON-per-collection engine; later phases move to a pa
 |-------|--------|
 | 0 | Baseline bug fixes, BenchmarkDotNet harness |
 | 1 | Page-based `.loahdb` store, B+Tree per collection, LRU page cache, `ImportLegacyV1` |
-| **2** (current) | WAL + fsync, atomic store transactions, writer lock, crash recovery |
-| 2 | WAL, ACID transactions, multi-process concurrency |
-| 3 | Secondary B+Tree indexes |
+| 2 | WAL + fsync, atomic store transactions, writer lock, crash recovery |
+| **3** (current) | On-disk secondary B+Tree indexes (composite, nested, range, multikey) |
 | 4 | LINQ query planner |
 | 5 | Schema, integrity, vacuum, online backup |
 | 6 | Authenticated encryption (AES-GCM, KDF) |

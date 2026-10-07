@@ -20,6 +20,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
     private readonly LoahPageStore? _pageStore;
     private int _documentCount;
     private uint _treeRootPageId;
+    private SecondaryIndexManager? _secondaryIndexes;
 
     internal LoahCollection(LoahStore store, string name)
     {
@@ -88,7 +89,8 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
                 }
             }
 
-            RebuildIndexes();
+            ApplySecondaryIndexInserts(inserted);
+            RebuildInMemoryIndexesIfNeeded();
         }
         catch
         {
@@ -96,6 +98,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
             {
                 foreach (var document in inserted)
                 {
+                    ApplySecondaryIndexDelete(document);
                     GetTree().Delete(document.Id);
                     _byId.Remove(document.Id);
                 }
@@ -141,12 +144,14 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
                 _byId[document.Id] = document;
             }
 
-            RebuildIndexes();
+            ApplySecondaryIndexInsert(document);
+            RebuildInMemoryIndexesIfNeeded();
         }
         catch
         {
             if (_pageStore is not null)
             {
+                ApplySecondaryIndexDelete(document);
                 GetTree().Delete(document.Id);
                 _byId.Remove(document.Id);
                 _documentCount--;
@@ -215,7 +220,8 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
             _byId[document.Id] = document;
         }
 
-        RebuildIndexes();
+        ApplySecondaryIndexUpdate(existing, document);
+        RebuildInMemoryIndexesIfNeeded();
         Persist();
         OnChanged(LoahChangeKind.Update, 1);
         return document;
@@ -248,8 +254,9 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
             _data.Documents.Remove(doc);
         }
 
+        ApplySecondaryIndexDelete(doc);
         _byId.Remove(id);
-        RebuildIndexes();
+        RebuildInMemoryIndexesIfNeeded();
         Persist();
         OnChanged(LoahChangeKind.Delete, 1);
         return true;
@@ -282,7 +289,12 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
             _documentCount -= matches.Count;
         }
 
-        RebuildIndexes();
+        foreach (var doc in matches)
+        {
+            ApplySecondaryIndexDelete(doc);
+        }
+
+        RebuildInMemoryIndexesIfNeeded();
         Persist();
         OnChanged(LoahChangeKind.Delete, matches.Count);
         return matches.Count;
@@ -298,28 +310,67 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
 
     public void EnsureIndex<TKey>(string indexName, Expression<Func<T, TKey>> keySelector, bool unique = false)
     {
-        if (keySelector.Body is not MemberExpression member)
-        {
-            throw new ArgumentException("Index key must be a simple property access.", nameof(keySelector));
-        }
+        var path = ExpressionPath.GetMemberPath(keySelector);
+        EnsureIndexCore(indexName, new[] { path }, unique);
+    }
 
+    public void EnsureCompositeIndex<TKey1, TKey2>(
+        string indexName,
+        Expression<Func<T, TKey1>> keySelector1,
+        Expression<Func<T, TKey2>> keySelector2,
+        bool unique = false)
+    {
+        var paths = new[]
+        {
+            ExpressionPath.GetMemberPath(keySelector1),
+            ExpressionPath.GetMemberPath(keySelector2),
+        };
+        EnsureIndexCore(indexName, paths, unique);
+    }
+
+    public T? FindByIndexParts(string indexName, params object?[] keyParts)
+    {
         var definition = _data.IndexDefinitions.FirstOrDefault(i =>
             i.Name.Equals(indexName, StringComparison.OrdinalIgnoreCase));
         if (definition is null)
         {
-            definition = new LoahIndexDefinition();
-            _data.IndexDefinitions.Add(definition);
+            return null;
         }
 
-        definition.Name = indexName;
-        definition.PropertyName = member.Member.Name;
-        definition.Unique = unique;
-        RebuildIndexes();
-        Persist();
+        var encoded = IndexKeyEncoding.EncodeComposite(keyParts);
+        if (_pageStore is not null && definition.Name != LoahStore.DefaultIdIndexName)
+        {
+            var docId = GetSecondaryManager().FindFirstDocumentId(definition, encoded);
+            return docId is null ? null : GetById(docId);
+        }
+
+        var key = DecodeKeyForJsonLookup(encoded);
+        if (!_data.Indexes.TryGetValue(indexName, out var lookup) ||
+            !lookup.TryGetValue(key, out var ids) ||
+            ids.Count == 0)
+        {
+            return null;
+        }
+
+        return GetById(ids[0]);
     }
 
     public T? FindByIndex<TKey>(string indexName, TKey key)
     {
+        var definition = _data.IndexDefinitions.FirstOrDefault(i =>
+            i.Name.Equals(indexName, StringComparison.OrdinalIgnoreCase));
+        if (definition is null)
+        {
+            return null;
+        }
+
+        if (_pageStore is not null && definition.Name != LoahStore.DefaultIdIndexName)
+        {
+            var encoded = IndexKeyEncoding.EncodeFromUserKey(key);
+            var docId = GetSecondaryManager().FindFirstDocumentId(definition, encoded);
+            return docId is null ? null : GetById(docId);
+        }
+
         var normalized = NormalizeKey(key);
         if (!_data.Indexes.TryGetValue(indexName, out var lookup) ||
             !lookup.TryGetValue(normalized, out var ids) ||
@@ -329,6 +380,55 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         }
 
         return GetById(ids[0]);
+    }
+
+    public IReadOnlyList<T> FindByIndexRange<TKey>(
+        string indexName,
+        TKey? minInclusive,
+        TKey? maxInclusive,
+        bool descending = false)
+    {
+        var definition = _data.IndexDefinitions.FirstOrDefault(i =>
+            i.Name.Equals(indexName, StringComparison.OrdinalIgnoreCase));
+        if (definition is null)
+        {
+            return Array.Empty<T>();
+        }
+
+        if (_pageStore is not null && definition.Name != LoahStore.DefaultIdIndexName)
+        {
+            var min = minInclusive is null ? null : IndexKeyEncoding.EncodeFromUserKey(minInclusive);
+            var max = maxInclusive is null ? null : IndexKeyEncoding.EncodeFromUserKey(maxInclusive);
+            return GetSecondaryManager()
+                .RangeDocumentIds(definition, min, max, descending)
+                .Select(id => GetById(id))
+                .Where(d => d is not null)
+                .Select(d => d!)
+                .ToList();
+        }
+
+        var lookup = _data.Indexes.TryGetValue(indexName, out var map) ? map : new Dictionary<string, List<string>>();
+        var minKey = minInclusive is null ? null : NormalizeKey(minInclusive);
+        var maxKey = maxInclusive is null ? null : NormalizeKey(maxInclusive);
+        var keys = lookup.Keys
+            .Where(k => (minKey is null || string.CompareOrdinal(k, minKey) >= 0) &&
+                        (maxKey is null || string.CompareOrdinal(k, maxKey) <= 0))
+            .OrderBy(k => k, descending ? Comparer<string>.Create((a, b) => string.CompareOrdinal(b, a)) : Comparer<string>.Default);
+
+        var results = new List<T>();
+        foreach (var indexKey in keys)
+        {
+            foreach (var id in lookup[indexKey])
+            {
+                var doc = GetById(id);
+                if (doc is not null)
+                {
+                    results.Add(doc);
+                }
+            }
+        }
+
+        return results;
     }
 
     public void Reload()
@@ -345,7 +445,8 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
             _treeRootPageId = entry.RootPageId;
             _documentCount = GetTree().Scan().Count();
             EnsureDefaultIdIndexDefinition();
-            RebuildIndexes();
+            RegisterSecondaryIndexes();
+            RebuildInMemoryIndexesIfNeeded();
             return;
         }
 
@@ -357,7 +458,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
 
         EnsureDefaultIdIndexDefinition();
         RebuildIdMap();
-        RebuildIndexes();
+        RebuildJsonIndexes();
     }
 
     internal void Persist()
@@ -411,27 +512,56 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
     {
         foreach (var definition in _data.IndexDefinitions.Where(d => d.Unique))
         {
-            var key = NormalizeKey(GetPropertyValue(document, definition.PropertyName));
-            if (!_data.Indexes.TryGetValue(definition.Name, out var lookup) ||
-                !lookup.TryGetValue(key, out var ids))
+            if (definition.Name == LoahStore.DefaultIdIndexName)
             {
                 continue;
             }
 
-            foreach (var id in ids)
+            foreach (var encodedKey in GetEncodedKeys(definition, document))
             {
-                if (excludeDocumentId is not null && id == excludeDocumentId)
+                if (_pageStore is not null)
+                {
+                    if (GetSecondaryManager().HasUniqueKey(definition, encodedKey, excludeDocumentId))
+                    {
+                        throw new InvalidOperationException(
+                            $"Unique index '{definition.Name}' violation for key '{encodedKey}'.");
+                    }
+
+                    continue;
+                }
+
+                var key = DecodeKeyForJsonLookup(encodedKey);
+                if (!_data.Indexes.TryGetValue(definition.Name, out var lookup) ||
+                    !lookup.TryGetValue(key, out var ids))
                 {
                     continue;
                 }
 
-                throw new InvalidOperationException(
-                    $"Unique index '{definition.Name}' violation for key '{key}'.");
+                foreach (var id in ids)
+                {
+                    if (excludeDocumentId is not null && id == excludeDocumentId)
+                    {
+                        continue;
+                    }
+
+                    throw new InvalidOperationException(
+                        $"Unique index '{definition.Name}' violation for key '{key}'.");
+                }
             }
         }
     }
 
-    private void RebuildIndexes()
+    private void RebuildInMemoryIndexesIfNeeded()
+    {
+        if (_pageStore is not null)
+        {
+            return;
+        }
+
+        RebuildJsonIndexes();
+    }
+
+    private void RebuildJsonIndexes()
     {
         _data.Indexes.Clear();
         foreach (var definition in _data.IndexDefinitions)
@@ -439,22 +569,25 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
             var lookup = new Dictionary<string, List<string>>(StringComparer.Ordinal);
             foreach (var doc in EnumerateDocuments())
             {
-                var key = NormalizeKey(GetPropertyValue(doc, definition.PropertyName));
-                if (!lookup.TryGetValue(key, out var ids))
+                foreach (var encoded in GetEncodedKeys(definition, doc))
                 {
-                    ids = new List<string>();
-                    lookup[key] = ids;
-                }
+                    var key = DecodeKeyForJsonLookup(encoded);
+                    if (!lookup.TryGetValue(key, out var ids))
+                    {
+                        ids = new List<string>();
+                        lookup[key] = ids;
+                    }
 
-                if (definition.Unique && ids.Count > 0 && !ids.Contains(doc.Id))
-                {
-                    throw new InvalidOperationException(
-                        $"Unique index '{definition.Name}' violation for key '{key}'.");
-                }
+                    if (definition.Unique && ids.Count > 0 && !ids.Contains(doc.Id))
+                    {
+                        throw new InvalidOperationException(
+                            $"Unique index '{definition.Name}' violation for key '{key}'.");
+                    }
 
-                if (!ids.Contains(doc.Id))
-                {
-                    ids.Add(doc.Id);
+                    if (!ids.Contains(doc.Id))
+                    {
+                        ids.Add(doc.Id);
+                    }
                 }
             }
 
@@ -462,15 +595,130 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         }
     }
 
-    private static object? GetPropertyValue(T document, string propertyName)
+    private void EnsureIndexCore(string indexName, IReadOnlyList<string> propertyPaths, bool unique)
     {
-        var property = typeof(T).GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
-        if (property is null)
+        var definition = _data.IndexDefinitions.FirstOrDefault(i =>
+            i.Name.Equals(indexName, StringComparison.OrdinalIgnoreCase));
+        if (definition is null)
         {
-            throw new InvalidOperationException($"Property '{propertyName}' was not found on '{typeof(T).Name}'.");
+            definition = new LoahIndexDefinition();
+            _data.IndexDefinitions.Add(definition);
         }
 
-        return property.GetValue(document);
+        definition.Name = indexName;
+        definition.PropertyPaths = propertyPaths.ToList();
+        definition.PropertyName = propertyPaths[0];
+        definition.Unique = unique;
+
+        if (_pageStore is not null && definition.Name != LoahStore.DefaultIdIndexName)
+        {
+            var docs = EnumerateDocuments().Select(d => (d.Id, (object)d));
+            GetSecondaryManager().Rebuild(definition, docs);
+        }
+        else
+        {
+            RebuildJsonIndexes();
+        }
+
+        Persist();
+    }
+
+    private SecondaryIndexManager GetSecondaryManager()
+    {
+        if (_pageStore is null)
+        {
+            throw new InvalidOperationException("Secondary B+Tree indexes require page-file storage.");
+        }
+
+        _secondaryIndexes ??= new SecondaryIndexManager(_pageStore.Database);
+        return _secondaryIndexes;
+    }
+
+    private void RegisterSecondaryIndexes()
+    {
+        if (_pageStore is null)
+        {
+            return;
+        }
+
+        var manager = GetSecondaryManager();
+        foreach (var definition in _data.IndexDefinitions.Where(d => d.Name != LoahStore.DefaultIdIndexName))
+        {
+            manager.Register(definition);
+        }
+    }
+
+    private void ApplySecondaryIndexInsert(T document) => ApplySecondaryIndexInserts(new[] { document });
+
+    private void ApplySecondaryIndexInserts(IEnumerable<T> documents)
+    {
+        if (_pageStore is null)
+        {
+            return;
+        }
+
+        var manager = GetSecondaryManager();
+        foreach (var definition in _data.IndexDefinitions.Where(d => d.Name != LoahStore.DefaultIdIndexName))
+        {
+            foreach (var document in documents)
+            {
+                manager.AddDocument(definition, document.Id, document);
+            }
+        }
+    }
+
+    private void ApplySecondaryIndexUpdate(T previous, T current)
+    {
+        if (_pageStore is null)
+        {
+            return;
+        }
+
+        var manager = GetSecondaryManager();
+        foreach (var definition in _data.IndexDefinitions.Where(d => d.Name != LoahStore.DefaultIdIndexName))
+        {
+            manager.RemoveDocument(definition, previous.Id, previous);
+            manager.AddDocument(definition, current.Id, current);
+        }
+    }
+
+    private void ApplySecondaryIndexDelete(T document)
+    {
+        if (_pageStore is null)
+        {
+            return;
+        }
+
+        var manager = GetSecondaryManager();
+        foreach (var definition in _data.IndexDefinitions.Where(d => d.Name != LoahStore.DefaultIdIndexName))
+        {
+            manager.RemoveDocument(definition, document.Id, document);
+        }
+    }
+
+    private static IEnumerable<string> GetEncodedKeys(LoahIndexDefinition definition, T document)
+    {
+        foreach (var raw in IndexValueExtractor.GetKeyValues(document, definition.GetPaths()))
+        {
+            if (raw is IList<object?> list)
+            {
+                yield return IndexKeyEncoding.EncodeComposite(list);
+            }
+            else
+            {
+                yield return IndexKeyEncoding.EncodeSingle(raw);
+            }
+        }
+    }
+
+    private static string DecodeKeyForJsonLookup(string encodedKey)
+    {
+        if (encodedKey.Length >= 2 && encodedKey[0] == '\0' && encodedKey[1] == 'S')
+        {
+            return encodedKey[2..];
+        }
+
+        return encodedKey;
     }
 
     private static string NormalizeKey<TKey>(TKey key) =>
