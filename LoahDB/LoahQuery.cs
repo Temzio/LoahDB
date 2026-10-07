@@ -24,13 +24,15 @@ public sealed class LoahQuery<T>
 
     public LoahQuery<T> OrderBy<TKey>(Expression<Func<T, TKey>> keySelector)
     {
-        _orderings.Add((false, o => keySelector.Compile()(o)!));
+        var compiled = keySelector.Compile();
+        _orderings.Add((false, o => compiled(o)!));
         return this;
     }
 
     public LoahQuery<T> OrderByDescending<TKey>(Expression<Func<T, TKey>> keySelector)
     {
-        _orderings.Add((true, o => keySelector.Compile()(o)!));
+        var compiled = keySelector.Compile();
+        _orderings.Add((true, o => compiled(o)!));
         return this;
     }
 

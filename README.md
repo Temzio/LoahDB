@@ -73,8 +73,34 @@ For heavy concurrent write load, very large datasets, or complex server-side que
 ## Build & test
 
 ```bash
+dotnet build LoahDB.sln
 dotnet test LoahDB.sln
 ```
+
+### Benchmarks (Phase 0 baseline)
+
+Compare LoahDB, SQLite, and LiteDB (insert, point lookup, range/ordered query, update, delete):
+
+```bash
+dotnet run -c Release --project LoahDB.Benchmarks
+```
+
+Benchmarks use the current JSON-per-collection engine; later phases move to a page-based `.loahdb` file without changing the public API.
+
+## Roadmap
+
+| Phase | Focus |
+|-------|--------|
+| **0** (current) | Baseline bug fixes, BenchmarkDotNet harness |
+| 1 | Page-based single-file storage (`.loahdb`) |
+| 2 | WAL, ACID transactions, multi-process concurrency |
+| 3 | Secondary B+Tree indexes |
+| 4 | LINQ query planner |
+| 5 | Schema, integrity, vacuum, online backup |
+| 6 | Authenticated encryption (AES-GCM, KDF) |
+| 7 | CLI tool, packaging, optional FTS |
+
+See [docs/ADR-0-phase-0-baseline.md](docs/ADR-0-phase-0-baseline.md) for Phase 0 design notes.
 
 ## License
 

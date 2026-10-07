@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace LoahDB;
 
 /// <summary>
@@ -6,7 +8,7 @@ namespace LoahDB;
 public sealed class LoahStore
 {
     internal const string DefaultIdIndexName = "_id";
-    private readonly Dictionary<string, object> _collections = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, object> _collections = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _metadataPath;
     private LoahTransaction? _activeTransaction;
 
@@ -33,9 +35,13 @@ public sealed class LoahStore
         }
 
         var collection = new LoahCollection<T>(this, name);
-        _collections[key] = collection;
-        RegisterCollectionName(name);
-        return collection;
+        if (_collections.TryAdd(key, collection))
+        {
+            RegisterCollectionName(name);
+            return collection;
+        }
+
+        return (LoahCollection<T>)_collections[key];
     }
 
     public LoahTransaction BeginTransaction() => _activeTransaction ??= new LoahTransaction(this);

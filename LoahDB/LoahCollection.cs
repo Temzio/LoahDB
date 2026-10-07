@@ -13,6 +13,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
     private readonly LoahStorage _storage;
     private readonly string _filePath;
     private LoahCollectionData<T> _data = new();
+    private readonly Dictionary<string, T> _byId = new(StringComparer.Ordinal);
 
     internal LoahCollection(LoahStore store, string name)
     {
@@ -29,7 +30,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
 
     public int Count => _data.Documents.Count;
 
-    public T? GetById(string id) => _data.Documents.FirstOrDefault(d => d.Id == id);
+    public T? GetById(string id) => _byId.TryGetValue(id, out var doc) ? doc : null;
 
     /// <summary>Raised after documents are inserted, updated, or deleted (after persist).</summary>
     public event EventHandler<LoahCollectionChangedEventArgs>? Changed;
@@ -39,9 +40,31 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         var inserted = new List<T>();
         foreach (var document in documents)
         {
-            inserted.Add(Insert(document, raiseChanged: false));
+            inserted.Add(PrepareInsert(document));
         }
 
+        try
+        {
+            foreach (var document in inserted)
+            {
+                _data.Documents.Add(document);
+                _byId[document.Id] = document;
+            }
+
+            RebuildIndexes();
+        }
+        catch
+        {
+            foreach (var document in inserted)
+            {
+                _data.Documents.Remove(document);
+                _byId.Remove(document.Id);
+            }
+
+            throw;
+        }
+
+        Persist();
         OnChanged(LoahChangeKind.BulkInsert, inserted.Count);
         return inserted;
     }
@@ -50,18 +73,21 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
 
     private T Insert(T document, bool raiseChanged)
     {
-        if (string.IsNullOrWhiteSpace(document.Id))
+        document = PrepareInsert(document);
+
+        try
         {
-            document.Id = Guid.NewGuid().ToString("N");
+            _data.Documents.Add(document);
+            _byId[document.Id] = document;
+            RebuildIndexes();
+        }
+        catch
+        {
+            _data.Documents.Remove(document);
+            _byId.Remove(document.Id);
+            throw;
         }
 
-        if (_data.Documents.Any(d => d.Id == document.Id))
-        {
-            throw new InvalidOperationException($"Document with id '{document.Id}' already exists.");
-        }
-
-        _data.Documents.Add(document);
-        RebuildIndexes();
         Persist();
         if (raiseChanged)
         {
@@ -71,15 +97,34 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         return document;
     }
 
+    private T PrepareInsert(T document)
+    {
+        if (string.IsNullOrWhiteSpace(document.Id))
+        {
+            document.Id = Guid.NewGuid().ToString("N");
+        }
+
+        if (_byId.ContainsKey(document.Id))
+        {
+            throw new InvalidOperationException($"Document with id '{document.Id}' already exists.");
+        }
+
+        ValidateUniqueIndexesForDocument(document);
+        return document;
+    }
+
     public T Update(T document)
     {
-        var index = _data.Documents.FindIndex(d => d.Id == document.Id);
-        if (index < 0)
+        if (!_byId.TryGetValue(document.Id, out var existing))
         {
             throw new KeyNotFoundException($"Document with id '{document.Id}' was not found.");
         }
 
+        ValidateUniqueIndexesForDocument(document, excludeDocumentId: document.Id);
+
+        var index = _data.Documents.IndexOf(existing);
         _data.Documents[index] = document;
+        _byId[document.Id] = document;
         RebuildIndexes();
         Persist();
         OnChanged(LoahChangeKind.Update, 1);
@@ -98,13 +143,13 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
 
     public bool Delete(string id)
     {
-        var doc = GetById(id);
-        if (doc is null)
+        if (!_byId.TryGetValue(id, out var doc))
         {
             return false;
         }
 
         _data.Documents.Remove(doc);
+        _byId.Remove(id);
         RebuildIndexes();
         Persist();
         OnChanged(LoahChangeKind.Delete, 1);
@@ -122,6 +167,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         foreach (var doc in matches)
         {
             _data.Documents.Remove(doc);
+            _byId.Remove(doc.Id);
         }
 
         RebuildIndexes();
@@ -130,7 +176,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         return matches.Count;
     }
 
-    public LoahQuery<T> Query() => new LoahQuery<T>(_data.Documents);
+    public LoahQuery<T> Query() => new LoahQuery<T>(_data.Documents.ToList());
 
     public List<T> Find(Expression<Func<T, bool>> predicate) =>
         Query().Where(predicate).ToList();
@@ -182,6 +228,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         }
 
         EnsureDefaultIdIndexDefinition();
+        RebuildIdMap();
         RebuildIndexes();
     }
 
@@ -198,6 +245,18 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         }
     }
 
+    private void RebuildIdMap()
+    {
+        _byId.Clear();
+        foreach (var doc in _data.Documents)
+        {
+            if (!string.IsNullOrEmpty(doc.Id))
+            {
+                _byId[doc.Id] = doc;
+            }
+        }
+    }
+
     private void EnsureDefaultIdIndexDefinition()
     {
         if (_data.IndexDefinitions.All(i => i.Name != LoahStore.DefaultIdIndexName))
@@ -208,6 +267,30 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
                 PropertyName = nameof(ILoahDocument.Id),
                 Unique = true,
             });
+        }
+    }
+
+    private void ValidateUniqueIndexesForDocument(T document, string? excludeDocumentId = null)
+    {
+        foreach (var definition in _data.IndexDefinitions.Where(d => d.Unique))
+        {
+            var key = NormalizeKey(GetPropertyValue(document, definition.PropertyName));
+            if (!_data.Indexes.TryGetValue(definition.Name, out var lookup) ||
+                !lookup.TryGetValue(key, out var ids))
+            {
+                continue;
+            }
+
+            foreach (var id in ids)
+            {
+                if (excludeDocumentId is not null && id == excludeDocumentId)
+                {
+                    continue;
+                }
+
+                throw new InvalidOperationException(
+                    $"Unique index '{definition.Name}' violation for key '{key}'.");
+            }
         }
     }
 

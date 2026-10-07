@@ -9,6 +9,9 @@ public sealed class LoahStorage
 {
     private readonly LoahOptions _options;
 
+    /// <summary>Increments on each successful <see cref="Write{T}"/> (for tests).</summary>
+    internal int WriteInvocationCount { get; private set; }
+
     public LoahStorage(LoahOptions options)
     {
         _options = options.Clone();
@@ -99,6 +102,8 @@ public sealed class LoahStorage
             {
                 File.WriteAllText(filePath, json);
             }
+
+            WriteInvocationCount++;
         }
     }
 
