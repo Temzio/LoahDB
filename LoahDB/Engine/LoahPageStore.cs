@@ -68,6 +68,14 @@ internal sealed class LoahPageStore : IDisposable
         catalog.Insert(collectionName, Encoding.UTF8.GetBytes(json));
     }
 
+    public LoahIntegrityReport CheckIntegrity() => new PageIntegrityChecker(_database).Check();
+
+    public void CheckpointForBackup() => _database.CheckpointForBackup();
+
+    public void Vacuum() => _database.Vacuum();
+
+    public IReadOnlyCollection<string> CatalogCollectionNames => _catalogCache.Keys.ToList();
+
     public void Dispose() => _database.Dispose();
 
     private void LoadCatalogCache()

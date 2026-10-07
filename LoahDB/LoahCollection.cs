@@ -9,7 +9,7 @@ namespace LoahDB;
 /// <summary>
 /// A named collection of documents persisted as a single JSON file.
 /// </summary>
-public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : class, ILoahDocument
+public sealed class LoahCollection<T> : ILoahCollectionReloadable, ILoahReferenceQueryable where T : class, ILoahDocument
 {
     private readonly LoahStore _store;
     private readonly string _name;
@@ -33,6 +33,17 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
     }
 
     public string Name => _name;
+
+    /// <summary>Optional schema enforced on insert and update.</summary>
+    public LoahCollectionSchema? Schema => _data.Schema;
+
+    /// <summary>Persists validation rules for this collection.</summary>
+    public void SetSchema(LoahCollectionSchema? schema)
+    {
+        _data.Schema = schema;
+        _store.RegisterReferenceQueryable(this);
+        Persist();
+    }
 
     public IReadOnlyList<T> All() => EnumerateDocuments().ToList();
 
@@ -194,6 +205,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         }
 
         ValidateUniqueIndexesForDocument(document);
+        ValidateSchema(document);
         return document;
     }
 
@@ -205,6 +217,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         }
 
         ValidateUniqueIndexesForDocument(document, excludeDocumentId: document.Id);
+        ValidateSchema(document);
 
         if (_pageStore is not null)
         {
@@ -237,16 +250,23 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         return GetById(document.Id) is null ? Insert(document) : Update(document);
     }
 
-    public bool Delete(string id)
+    public bool Delete(string id) => DeleteById(id, enforceReferentialIntegrity: true);
+
+    internal bool DeleteById(string documentId, bool enforceReferentialIntegrity)
     {
-        if (!_byId.TryGetValue(id, out var doc))
+        if (!_byId.TryGetValue(documentId, out var doc))
         {
             return false;
         }
 
+        if (enforceReferentialIntegrity)
+        {
+            _store.EnforceReferentialActionsOnParentDelete(_name, doc);
+        }
+
         if (_pageStore is not null)
         {
-            GetTree().Delete(id);
+            GetTree().Delete(documentId);
             _documentCount--;
         }
         else
@@ -255,7 +275,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         }
 
         ApplySecondaryIndexDelete(doc);
-        _byId.Remove(id);
+        _byId.Remove(documentId);
         RebuildInMemoryIndexesIfNeeded();
         Persist();
         OnChanged(LoahChangeKind.Delete, 1);
@@ -272,6 +292,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
 
         foreach (var doc in matches)
         {
+            _store.EnforceReferentialActionsOnParentDelete(_name, doc);
             if (_pageStore is not null)
             {
                 GetTree().Delete(doc.Id);
@@ -552,7 +573,9 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
             {
                 Name = _name,
                 IndexDefinitions = entry.IndexDefinitions,
+                Schema = entry.Schema,
             };
+            _store.RegisterReferenceQueryable(this);
             _byId.Clear();
             _treeRootPageId = entry.RootPageId;
             _documentCount = GetTree().Scan().Count();
@@ -571,6 +594,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         EnsureDefaultIdIndexDefinition();
         RebuildIdMap();
         RebuildJsonIndexes();
+        _store.RegisterReferenceQueryable(this);
     }
 
     internal void Persist()
@@ -581,6 +605,7 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
             var entry = _pageStore.GetOrCreateCatalogEntry(_name);
             entry.IndexDefinitions = _data.IndexDefinitions;
             entry.RootPageId = _treeRootPageId;
+            entry.Schema = _data.Schema;
             _pageStore.SaveCatalogEntry(_name, entry);
             return;
         }
@@ -857,4 +882,123 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
     private T Deserialize(byte[] bytes) =>
         JsonConvert.DeserializeObject<T>(Encoding.UTF8.GetString(bytes), _store.Options.SerializerSettings)
         ?? throw new InvalidDataException("Failed to deserialize document.");
+
+    private void ValidateSchema(T document)
+    {
+        if (_data.Schema is null)
+        {
+            return;
+        }
+
+        LoahSchemaValidator.Validate(document, _data.Schema);
+        LoahSchemaValidator.ValidateReferences(_store, _name, document, _data.Schema);
+    }
+
+    string ILoahReferenceQueryable.CollectionName => _name;
+
+    LoahCollectionSchema? ILoahReferenceQueryable.Schema => _data.Schema;
+
+    IReadOnlyList<string> ILoahReferenceQueryable.AllDocumentIds() =>
+        _pageStore is null ? _byId.Keys.ToList() : GetTree().Scan().Select(p => p.Key).ToList();
+
+    bool ILoahReferenceQueryable.TryGetFieldValue(string documentId, string fieldPath, out string? value)
+    {
+        var doc = GetById(documentId);
+        if (doc is null)
+        {
+            value = null;
+            return false;
+        }
+
+        value = IndexValueExtractor.GetPropertyValue(doc, fieldPath)?.ToString();
+        return true;
+    }
+
+    bool ILoahReferenceQueryable.ExistsFieldValue(string fieldPath, string value)
+    {
+        if (string.Equals(fieldPath, nameof(ILoahDocument.Id), StringComparison.OrdinalIgnoreCase))
+        {
+            return GetById(value) is not null;
+        }
+
+        foreach (var doc in EnumerateDocuments())
+        {
+            var fieldValue = IndexValueExtractor.GetPropertyValue(doc, fieldPath)?.ToString();
+            if (string.Equals(fieldValue, value, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    IReadOnlyList<string> ILoahReferenceQueryable.FindIdsReferencing(string localField, string parentKey)
+    {
+        var ids = new List<string>();
+        foreach (var doc in EnumerateDocuments())
+        {
+            var fieldValue = IndexValueExtractor.GetPropertyValue(doc, localField)?.ToString();
+            if (string.Equals(fieldValue, parentKey, StringComparison.Ordinal))
+            {
+                ids.Add(doc.Id);
+            }
+        }
+
+        return ids;
+    }
+
+    bool ILoahReferenceQueryable.TrySetFieldNull(string documentId, string fieldPath)
+    {
+        var doc = GetById(documentId);
+        if (doc is null)
+        {
+            return false;
+        }
+
+        if (!SetPropertyToNull(doc, fieldPath))
+        {
+            return false;
+        }
+
+        Update(doc);
+        return true;
+    }
+
+    bool ILoahReferenceQueryable.DeleteById(string documentId) =>
+        DeleteById(documentId, enforceReferentialIntegrity: false);
+
+    private static bool SetPropertyToNull(T document, string propertyPath)
+    {
+        var segments = propertyPath.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (segments.Length == 0)
+        {
+            return false;
+        }
+
+        object? current = document;
+        for (var i = 0; i < segments.Length - 1; i++)
+        {
+            var property = current!.GetType().GetProperty(segments[i], BindingFlags.Public | BindingFlags.Instance);
+            if (property is null)
+            {
+                return false;
+            }
+
+            current = property.GetValue(current);
+            if (current is null)
+            {
+                return false;
+            }
+        }
+
+        var leaf = current!.GetType().GetProperty(segments[^1], BindingFlags.Public | BindingFlags.Instance);
+        if (leaf is null || !leaf.CanWrite)
+        {
+            return false;
+        }
+
+        leaf.SetValue(current, null);
+        return true;
+    }
 }

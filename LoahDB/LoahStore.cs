@@ -10,6 +10,8 @@ public sealed class LoahStore : IDisposable
 {
     internal const string DefaultIdIndexName = "_id";
     private readonly ConcurrentDictionary<string, object> _collections = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ILoahReferenceQueryable> _referenceQueryables =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly string _metadataPath;
     private LoahTransaction? _activeTransaction;
     private readonly LoahPageStore? _pageStore;
@@ -95,16 +97,147 @@ public sealed class LoahStore : IDisposable
     public void MigrateTo(int targetSchemaVersion, Action<int, LoahStore> migration)
     {
         var meta = Storage.Read<LoahStoreMetadata>(_metadataPath) ?? new LoahStoreMetadata();
-        while (meta.SchemaVersion < targetSchemaVersion)
+        if (meta.SchemaVersion >= targetSchemaVersion)
         {
-            var from = meta.SchemaVersion;
-            migration(from + 1, this);
-            meta.SchemaVersion = from + 1;
-            meta.UpdatedAtUtc = DateTime.UtcNow;
-            Storage.Write(_metadataPath, meta);
+            Options.SchemaVersion = meta.SchemaVersion;
+            return;
         }
 
-        Options.SchemaVersion = targetSchemaVersion;
+        using var tx = BeginTransaction();
+        try
+        {
+            while (meta.SchemaVersion < targetSchemaVersion)
+            {
+                var from = meta.SchemaVersion;
+                migration(from + 1, this);
+                meta.SchemaVersion = from + 1;
+                meta.UpdatedAtUtc = DateTime.UtcNow;
+                RegisterPendingWrite(_metadataPath, meta);
+            }
+
+            tx.Commit();
+            Options.SchemaVersion = targetSchemaVersion;
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+    }
+
+    /// <summary>Verifies page-file structure and optional reference constraints.</summary>
+    public LoahIntegrityReport CheckIntegrity()
+    {
+        var report = _pageStore?.CheckIntegrity() ?? new LoahIntegrityReport();
+        ValidateReferenceIntegrity(report);
+        return report;
+    }
+
+    /// <summary>Flushes the page store and checkpoints the WAL for online backup.</summary>
+    public void CheckpointForBackup() => _pageStore?.CheckpointForBackup();
+
+    /// <summary>Rewrites the page-file database to drop free pages.</summary>
+    public void Vacuum() => _pageStore?.Vacuum();
+
+    internal void RegisterReferenceQueryable(ILoahReferenceQueryable queryable) =>
+        _referenceQueryables[queryable.CollectionName] = queryable;
+
+    internal bool TryResolveReference(string referencedCollection, string referencedField, string key)
+    {
+        if (!_referenceQueryables.TryGetValue(referencedCollection, out var target))
+        {
+            return false;
+        }
+
+        return target.ExistsFieldValue(referencedField, key);
+    }
+
+    internal void EnforceReferentialActionsOnParentDelete(string parentCollectionName, object parentDocument)
+    {
+        foreach (var child in _referenceQueryables.Values)
+        {
+            var schema = child.Schema;
+            if (schema is null)
+            {
+                continue;
+            }
+
+            foreach (var reference in schema.References.Where(r =>
+                         r.ReferencedCollection.Equals(parentCollectionName, StringComparison.OrdinalIgnoreCase)))
+            {
+                var parentKey = IndexValueExtractor.GetPropertyValue(parentDocument, reference.ReferencedField)?.ToString();
+                if (string.IsNullOrEmpty(parentKey) && parentDocument is ILoahDocument loahDoc)
+                {
+                    parentKey = loahDoc.Id;
+                }
+
+                if (string.IsNullOrEmpty(parentKey))
+                {
+                    continue;
+                }
+
+                var childIds = child.FindIdsReferencing(reference.LocalField, parentKey);
+                if (childIds.Count == 0)
+                {
+                    continue;
+                }
+
+                switch (reference.OnDelete)
+                {
+                    case LoahDeleteAction.Restrict:
+                        throw new LoahSchemaException(
+                            $"Cannot delete document from '{parentCollectionName}' because collection '{child.CollectionName}' still references it (field '{reference.LocalField}').");
+                    case LoahDeleteAction.Cascade:
+                        foreach (var childId in childIds.ToList())
+                        {
+                            child.DeleteById(childId);
+                        }
+
+                        break;
+                    case LoahDeleteAction.SetNull:
+                        foreach (var childId in childIds)
+                        {
+                            child.TrySetFieldNull(childId, reference.LocalField);
+                        }
+
+                        break;
+                }
+            }
+        }
+    }
+
+    private void ValidateReferenceIntegrity(LoahIntegrityReport report)
+    {
+        foreach (var child in _referenceQueryables.Values)
+        {
+            var schema = child.Schema;
+            if (schema is null)
+            {
+                continue;
+            }
+
+            foreach (var reference in schema.References)
+            {
+                if (!_referenceQueryables.TryGetValue(reference.ReferencedCollection, out var parent))
+                {
+                    continue;
+                }
+
+                foreach (var id in child.AllDocumentIds())
+                {
+                    if (!child.TryGetFieldValue(id, reference.LocalField, out var local) || string.IsNullOrEmpty(local))
+                    {
+                        continue;
+                    }
+
+                    if (!parent.ExistsFieldValue(reference.ReferencedField, local))
+                    {
+                        report.Errors.Add(
+                            $"Reference violation: '{child.CollectionName}.{reference.LocalField}' = '{local}' was not found in '{reference.ReferencedCollection}'.");
+                    }
+                }
+            }
+        }
     }
 
     internal void RegisterPendingWrite(string filePath, object payload)

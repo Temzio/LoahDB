@@ -1,6 +1,7 @@
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Order;
 using LiteDB;
+using LiteDbQuery = LiteDB.Query;
 using LoahDB;
 using Microsoft.Data.Sqlite;
 
@@ -145,7 +146,7 @@ public class DocumentStoreBenchmarks
         using var db = new LiteDatabase(_liteDbPath);
         var col = db.GetCollection<BenchmarkDocument>("docs");
         var target = _seed[DocumentCount / 2].Email;
-        _ = col.FindOne(Query.EQ("Email", target));
+        _ = col.FindOne(LiteDbQuery.EQ("Email", target));
     }
 
     [Benchmark]
@@ -173,7 +174,7 @@ public class DocumentStoreBenchmarks
         PrepareLiteDb();
         using var db = new LiteDatabase(_liteDbPath);
         var col = db.GetCollection<BenchmarkDocument>("docs");
-        return col.Count(Query.And(Query.GTE("Age", 40), Query.LTE("Age", 45)));
+        return col.Count(LiteDbQuery.And(LiteDbQuery.GTE("Age", 40), LiteDbQuery.LTE("Age", 45)));
     }
 
     [Benchmark]

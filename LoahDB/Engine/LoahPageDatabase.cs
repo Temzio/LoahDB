@@ -1,4 +1,5 @@
 using System.Text;
+using Newtonsoft.Json;
 
 namespace LoahDB.Engine;
 
@@ -44,6 +45,10 @@ internal sealed class LoahPageDatabase : IDisposable
     }
 
     internal bool IsWriteBatchActive => _writeBatchDepth > 0;
+
+    public uint PageCount => _pageCount;
+
+    internal string DatabaseFilePath => _filePath;
 
     public int SchemaVersion => _schemaVersion;
 
@@ -440,5 +445,50 @@ internal sealed class LoahPageDatabase : IDisposable
         }
 
         return buffer;
+    }
+
+    internal void EnsureReadable()
+    {
+        var header = LoadPage(0);
+        ValidateHeader(header);
+    }
+
+    internal IEnumerable<(string Collection, string DocId, byte[] Payload)> EnumerateAllCollectionDocuments()
+    {
+        var catalog = OpenCatalog();
+        foreach (var (name, metaBytes) in catalog.Scan())
+        {
+            var json = Encoding.UTF8.GetString(metaBytes);
+            var entry = JsonConvert.DeserializeObject<CollectionCatalogEntry>(json);
+            if (entry is null)
+            {
+                continue;
+            }
+
+            var tree = OpenTree(entry.RootPageId);
+            foreach (var (docId, payload) in tree.Scan())
+            {
+                yield return (name, docId, payload);
+            }
+        }
+    }
+
+    internal void CheckpointForBackup()
+    {
+        Flush();
+        _wal.AppendCheckpoint();
+    }
+
+    internal void Vacuum()
+    {
+        lock (_writeLock)
+        {
+            Flush();
+            _freeListHead = 0;
+            WriteHeader();
+            Flush();
+            _stream.SetLength(_pageCount * LoahConstants.PageSize);
+            _wal.AppendCheckpoint();
+        }
     }
 }
