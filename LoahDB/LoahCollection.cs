@@ -300,7 +300,119 @@ public sealed class LoahCollection<T> : ILoahCollectionReloadable where T : clas
         return matches.Count;
     }
 
-    public LoahQuery<T> Query() => new LoahQuery<T>(EnumerateDocuments().ToList());
+    public LoahQuery<T> Query() => new LoahQuery<T>(this, EnumerateDocuments().ToList());
+
+    internal IReadOnlyList<T> SnapshotForQuery() => EnumerateDocuments().ToList();
+
+    internal IReadOnlyList<LoahIndexDefinition> QueryIndexDefinitions() => _data.IndexDefinitions;
+
+    internal LoahIndexDefinition? FindIndexForPropertyPath(string propertyPath) =>
+        _data.IndexDefinitions.FirstOrDefault(i =>
+            i.Name != LoahStore.DefaultIdIndexName &&
+            i.GetPaths().Count == 1 &&
+            i.GetPaths()[0] == propertyPath);
+
+    internal IEnumerable<T> QueryExecuteIndexSeek(string indexName, object? value, IReadOnlyList<T> snapshot)
+    {
+        var definition = _data.IndexDefinitions.FirstOrDefault(i =>
+            i.Name.Equals(indexName, StringComparison.OrdinalIgnoreCase));
+        if (definition is null)
+        {
+            yield break;
+        }
+
+        var snapshotIds = snapshot.Select(d => d.Id).ToHashSet(StringComparer.Ordinal);
+        if (_pageStore is not null && definition.Name != LoahStore.DefaultIdIndexName)
+        {
+            var encoded = IndexKeyEncoding.EncodeFromUserKey(value);
+            var docId = GetSecondaryManager().FindFirstDocumentId(definition, encoded);
+            if (docId is not null && snapshotIds.Contains(docId))
+            {
+                var doc = snapshot.FirstOrDefault(d => d.Id == docId);
+                if (doc is not null)
+                {
+                    yield return doc;
+                }
+            }
+
+            yield break;
+        }
+
+        var normalized = value?.ToString() ?? string.Empty;
+        if (_data.Indexes.TryGetValue(indexName, out var lookup) &&
+            lookup.TryGetValue(normalized, out var ids))
+        {
+            foreach (var id in ids.Where(snapshotIds.Contains))
+            {
+                var doc = snapshot.FirstOrDefault(d => d.Id == id);
+                if (doc is not null)
+                {
+                    yield return doc;
+                }
+            }
+        }
+    }
+
+    internal IEnumerable<T> QueryExecuteIndexRange(
+        string indexName,
+        object? minInclusive,
+        object? maxInclusive,
+        bool descending,
+        IReadOnlyList<T> snapshot)
+    {
+        var definition = _data.IndexDefinitions.FirstOrDefault(i =>
+            i.Name.Equals(indexName, StringComparison.OrdinalIgnoreCase));
+        if (definition is null)
+        {
+            yield break;
+        }
+
+        var snapshotIds = snapshot.Select(d => d.Id).ToHashSet(StringComparer.Ordinal);
+        if (_pageStore is not null && definition.Name != LoahStore.DefaultIdIndexName)
+        {
+            var min = minInclusive is null ? null : IndexKeyEncoding.EncodeFromUserKey(minInclusive);
+            var max = maxInclusive is null ? null : IndexKeyEncoding.EncodeFromUserKey(maxInclusive);
+            foreach (var id in GetSecondaryManager().RangeDocumentIds(definition, min, max, descending))
+            {
+                if (!snapshotIds.Contains(id))
+                {
+                    continue;
+                }
+
+                var doc = snapshot.FirstOrDefault(d => d.Id == id);
+                if (doc is not null)
+                {
+                    yield return doc;
+                }
+            }
+
+            yield break;
+        }
+
+        var minKey = minInclusive?.ToString();
+        var maxKey = maxInclusive?.ToString();
+        if (!_data.Indexes.TryGetValue(indexName, out var lookup))
+        {
+            yield break;
+        }
+
+        var keys = lookup.Keys
+            .Where(k => (minKey is null || string.CompareOrdinal(k, minKey) >= 0) &&
+                        (maxKey is null || string.CompareOrdinal(k, maxKey) <= 0))
+            .OrderBy(k => k, descending ? Comparer<string>.Create((a, b) => string.CompareOrdinal(b, a)) : Comparer<string>.Default);
+
+        foreach (var key in keys)
+        {
+            foreach (var id in lookup[key].Where(snapshotIds.Contains))
+            {
+                var doc = snapshot.FirstOrDefault(d => d.Id == id);
+                if (doc is not null)
+                {
+                    yield return doc;
+                }
+            }
+        }
+    }
 
     public List<T> Find(Expression<Func<T, bool>> predicate) =>
         Query().Where(predicate).ToList();
