@@ -9,10 +9,10 @@ public sealed class LoahStorage
 {
     private readonly LoahOptions _options;
 
-    public LoahStorage(LoahOptions options)
-    {
-        _options = options.Clone();
-    }
+    /// <summary>Increments on each successful <see cref="Write{T}"/> (for tests).</summary>
+    internal int WriteInvocationCount { get; private set; }
+
+    public LoahStorage(LoahOptions options) => _options = options;
 
     public string ResolvePath(string root, string key, string extension = ".loah")
     {
@@ -40,9 +40,9 @@ public sealed class LoahStorage
                 return default;
             }
 
-            if (!string.IsNullOrEmpty(_options.EncryptionKey))
+            if (ShouldDecrypt(json))
             {
-                json = CryptoLoah.Decrypt(json, _options.EncryptionKey);
+                json = LoahAuthenticatedCrypto.DecryptString(json, _options.EncryptionKey!, _options.KeyDerivationIterations);
             }
 
             return JsonConvert.DeserializeObject<T>(json, _options.SerializerSettings);
@@ -64,9 +64,9 @@ public sealed class LoahStorage
                 return default;
             }
 
-            if (!string.IsNullOrEmpty(_options.EncryptionKey))
+            if (ShouldDecrypt(json))
             {
-                json = CryptoLoah.Decrypt(json, _options.EncryptionKey);
+                json = LoahAuthenticatedCrypto.DecryptString(json, _options.EncryptionKey!, _options.KeyDerivationIterations);
             }
 
             return JsonConvert.DeserializeObject<T>(json, _options.SerializerSettings);
@@ -84,7 +84,7 @@ public sealed class LoahStorage
         var json = JsonConvert.SerializeObject(data, _options.SerializerSettings);
         if (!string.IsNullOrEmpty(_options.EncryptionKey))
         {
-            json = CryptoLoah.Encrypt(json, _options.EncryptionKey);
+            json = LoahAuthenticatedCrypto.EncryptString(json, _options.EncryptionKey, _options.KeyDerivationIterations);
         }
 
         using (AcquireLock(filePath))
@@ -99,6 +99,8 @@ public sealed class LoahStorage
             {
                 File.WriteAllText(filePath, json);
             }
+
+            WriteInvocationCount++;
         }
     }
 
@@ -113,7 +115,7 @@ public sealed class LoahStorage
         var json = JsonConvert.SerializeObject(data, _options.SerializerSettings);
         if (!string.IsNullOrEmpty(_options.EncryptionKey))
         {
-            json = CryptoLoah.Encrypt(json, _options.EncryptionKey);
+            json = LoahAuthenticatedCrypto.EncryptString(json, _options.EncryptionKey, _options.KeyDerivationIterations);
         }
 
         using (AcquireLock(filePath))
@@ -140,6 +142,23 @@ public sealed class LoahStorage
                 File.Delete(filePath);
             }
         }
+    }
+
+    private bool ShouldDecrypt(string json)
+    {
+        if (string.IsNullOrEmpty(_options.EncryptionKey))
+        {
+            return false;
+        }
+
+        var trimmed = json.TrimStart();
+        if (trimmed.StartsWith('{') || trimmed.StartsWith('['))
+        {
+            return false;
+        }
+
+        return trimmed.StartsWith(LoahAuthenticatedCrypto.GcmStringPrefix, StringComparison.Ordinal) ||
+               trimmed.Length > 0;
     }
 
     public IReadOnlyList<string> ListKeys(string root, string extension = ".loah")

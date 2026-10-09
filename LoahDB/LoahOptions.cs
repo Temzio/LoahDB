@@ -18,6 +18,9 @@ public sealed class LoahOptions
     /// </summary>
     public string? EncryptionKey { get; set; }
 
+    /// <summary>PBKDF2 iteration count when deriving keys from <see cref="EncryptionKey"/>.</summary>
+    public int KeyDerivationIterations { get; set; } = 100_000;
+
     /// <summary>
     /// Newtonsoft.Json settings used for serialization.
     /// </summary>
@@ -43,13 +46,26 @@ public sealed class LoahOptions
     /// </summary>
     public int SchemaVersion { get; set; } = 1;
 
+    /// <summary>
+    /// Storage engine layout. New stores default to <see cref="LoahStorageFormat.PageFile"/>.
+    /// </summary>
+    public LoahStorageFormat StorageFormat { get; set; } = LoahStorageFormat.PageFile;
+
+    /// <summary>
+    /// Maximum number of 4 KB pages kept in the LRU cache (page-file format only).
+    /// </summary>
+    public int PageCacheCapacity { get; set; } = 512;
+
     public LoahOptions Clone() => new()
     {
         BasePath = BasePath,
         EncryptionKey = EncryptionKey,
+        KeyDerivationIterations = KeyDerivationIterations,
         SerializerSettings = SerializerSettings,
         LockTimeout = LockTimeout,
         AtomicWrites = AtomicWrites,
         SchemaVersion = SchemaVersion,
+        StorageFormat = StorageFormat,
+        PageCacheCapacity = PageCacheCapacity,
     };
 }

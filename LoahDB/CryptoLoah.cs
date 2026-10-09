@@ -3,92 +3,46 @@ using System.Security.Cryptography;
 using System.Text;
 
 [assembly: InternalsVisibleTo("LoahDB.Tests")]
-namespace LoahDB
+namespace LoahDB;
+
+public class CryptoLoah
 {
+    protected internal static string Encrypt(string plainText, string key) =>
+        LoahAuthenticatedCrypto.EncryptString(plainText, key, 100_000);
 
-    public class CryptoLoah
+    protected internal static string Decrypt(string cipherText, string key) =>
+        LoahAuthenticatedCrypto.DecryptString(cipherText, key, 100_000);
+
+    internal static string DecryptLegacyCbc(string cipherText, string key)
     {
-        protected internal static string Encrypt(string plainText, string key)
+        var cipherBytes = Convert.FromBase64String(cipherText);
+        var keyBytes = AdjustKeySize(key, 256);
+        const int ivLength = 16;
+        if (cipherBytes.Length < ivLength)
         {
-            byte[] encrypted;
-            byte[] keyBytes = AdjustKeySize(key, 256);
-            byte[] ivBytes;
-
-            using (Aes aesAlg = Aes.Create())
-            {
-                aesAlg.Key = keyBytes;
-                aesAlg.GenerateIV(); // Generate a new IV for each encryption operation
-                ivBytes = aesAlg.IV;
-
-                ICryptoTransform encryptor = aesAlg.CreateEncryptor(aesAlg.Key, aesAlg.IV);
-
-                using (MemoryStream msEncrypt = new MemoryStream())
-                {
-                    // Write the IV to the beginning of the encrypted stream
-                    msEncrypt.Write(ivBytes, 0, ivBytes.Length);
-
-                    using (CryptoStream csEncrypt = new CryptoStream(msEncrypt, encryptor, CryptoStreamMode.Write))
-                    {
-                        using (StreamWriter swEncrypt = new StreamWriter(csEncrypt))
-                        {
-                            swEncrypt.Write(plainText);
-                        }
-                    }
-                    encrypted = msEncrypt.ToArray();
-                }
-            }
-
-            // Combine IV and ciphertext into a single Base64 encoded string
-            byte[] combinedBytes = new byte[ivBytes.Length + encrypted.Length];
-            Array.Copy(ivBytes, 0, combinedBytes, 0, ivBytes.Length);
-            Array.Copy(encrypted, 0, combinedBytes, ivBytes.Length, encrypted.Length);
-
-            return Convert.ToBase64String(combinedBytes);
+            throw new LoahEncryptionException("Legacy ciphertext is too short.");
         }
 
+        var ivBytes = cipherBytes.AsSpan(0, ivLength);
+        var encrypted = cipherBytes.AsSpan(ivLength);
 
-        protected internal static string Decrypt(string cipherText, string key)
-        {
-            byte[] cipherBytes = Convert.FromBase64String(cipherText);
-            string plaintext = null;
-            byte[] keyBytes = AdjustKeySize(key, 256);
-            byte[] ivBytes = new byte[16]; // Assuming IV size for AES is 128 bits (16 bytes)
+        using var aesAlg = Aes.Create();
+        aesAlg.Key = keyBytes;
+        aesAlg.IV = ivBytes.ToArray();
 
-            using (Aes aesAlg = Aes.Create())
-            {
-                aesAlg.Key = keyBytes;
+        using var decryptor = aesAlg.CreateDecryptor(aesAlg.Key, aesAlg.IV);
+        using var msDecrypt = new MemoryStream(encrypted.ToArray());
+        using var csDecrypt = new CryptoStream(msDecrypt, decryptor, CryptoStreamMode.Read);
+        using var srDecrypt = new StreamReader(csDecrypt);
+        return srDecrypt.ReadToEnd();
+    }
 
-                // Extract IV from the beginning of the ciphertext
-                Array.Copy(cipherBytes, ivBytes, ivBytes.Length);
-                var cipherList = cipherBytes.ToList();
-                cipherList.RemoveRange(0,ivBytes.Length);
-                cipherBytes=cipherList.ToArray();
-                aesAlg.IV = ivBytes;
-
-                ICryptoTransform decryptor = aesAlg.CreateDecryptor(aesAlg.Key, aesAlg.IV);
-
-                using (MemoryStream msDecrypt = new MemoryStream(cipherBytes, ivBytes.Length, cipherBytes.Length - ivBytes.Length))
-                {
-                    using (CryptoStream csDecrypt = new CryptoStream(msDecrypt, decryptor, CryptoStreamMode.Read))
-                    {
-                        using (StreamReader srDecrypt = new StreamReader(csDecrypt))
-                        {
-                            plaintext = srDecrypt.ReadToEnd();
-                        }
-                    }
-                }
-            }
-            return plaintext/*.Substring(ivBytes.ToString().Length)*/;
-        }
-
-
-        private static byte[] AdjustKeySize(string key, int bitSize)
-        {
-            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            int bytes = bitSize / 8;
-            byte[] adjustedKey = new byte[bytes];
-            Array.Copy(keyBytes, adjustedKey, Math.Min(keyBytes.Length, bytes));
-            return adjustedKey;
-        }
+    private static byte[] AdjustKeySize(string key, int bitSize)
+    {
+        var keyBytes = Encoding.UTF8.GetBytes(key);
+        var bytes = bitSize / 8;
+        var adjustedKey = new byte[bytes];
+        Array.Copy(keyBytes, adjustedKey, Math.Min(keyBytes.Length, bytes));
+        return adjustedKey;
     }
 }

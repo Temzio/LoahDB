@@ -24,6 +24,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\LoahDB\LoahDB.csproj" />
+    <ProjectReference Include="..\LoahDB.Cli\LoahDB.Cli.csproj" />
   </ItemGroup>
 
 </Project>

@@ -73,8 +73,72 @@ For heavy concurrent write load, very large datasets, or complex server-side que
 ## Build & test
 
 ```bash
+dotnet build LoahDB.sln
 dotnet test LoahDB.sln
 ```
+
+### Benchmarks
+
+Quick comparison table (10k docs, page-file engine):
+
+```bash
+dotnet run -c Release --project LoahDB.Benchmarks -- --quick-report docs/BENCHMARK-REPORT.md
+```
+
+Full BenchmarkDotNet suite (1k / 10k / 100k):
+
+```bash
+dotnet run -c Release --project LoahDB.Benchmarks
+```
+
+See [docs/BENCHMARK-REPORT.md](docs/BENCHMARK-REPORT.md).
+
+## Roadmap
+
+| Phase | Focus |
+|-------|--------|
+| 0 | Baseline bug fixes, BenchmarkDotNet harness |
+| 1 | Page-based `.loahdb` store, B+Tree per collection, LRU page cache, `ImportLegacyV1` |
+| 2 | WAL + fsync, atomic store transactions, writer lock, crash recovery |
+| 3 | On-disk secondary B+Tree indexes (composite, nested, range, multikey) |
+| 4 | Expression query planner, `Explain()`, aggregates, `Join` |
+| 5 | Collection schema, referential actions, `CheckIntegrity`, `Vacuum`, page-file backup |
+| 6 | PBKDF2 + AES-GCM payloads, legacy CBC read, `EnableEncryption`, `RotateEncryptionKey` |
+| **7** (current) | `loah` CLI tool, NuGet 2.0, optional FTS, benchmark report |
+
+Design notes: [ADR-0](docs/ADR-0-phase-0-baseline.md) … [ADR-7](docs/ADR-7-cli-packaging-fts.md).
+
+### Page-file store (Phase 1)
+
+New stores default to `LoahStorageFormat.PageFile` (`{BasePath}/{root}.loahdb`). JSON-per-collection layout remains available via `LoahStorageFormat.JsonCollections`. Import v1 data with `store.ImportLegacyV1()` after copying or creating `{root}/_collections/*.loah`.
+
+Page-file commits use a write-ahead log (`{root}.loahdb-wal`) with checksummed frames and recovery on open. `BeginTransaction()` stages work across collections; a second nested `BeginTransaction()` throws. Writer exclusivity uses `{root}.loahdb.writer.lock` (see `LoahOptions.LockTimeout`).
+
+Secondary indexes on page-file stores use per-index B+Trees (`EnsureIndex`, `EnsureCompositeIndex`, `FindByIndex`, `FindByIndexParts`, `FindByIndexRange`).
+
+`LoahQuery` builds an index-aware plan (`Explain()`), supports `Select`, `GroupBy`, `Join`, and aggregates (`Count`, `Sum`, `Min`, `Max`, `Average`, `Any`).
+
+### Schema & integrity (Phase 5)
+
+`LoahCollection.SetSchema` enforces required fields, coarse types, and optional references (`Restrict`, `Cascade`, `SetNull` on parent delete). `LoahStore.CheckIntegrity()` validates the page file and loaded reference graphs. `Vacuum()` compacts the `.loahdb` file; `LoahBackup.Export` checkpoints the WAL and includes the page file in the zip.
+
+### Encryption (Phase 6)
+
+Set `LoahOptions.EncryptionKey` when creating a page-file store to encrypt catalog and document payloads (PBKDF2 + AES-GCM). JSON collection files use the `LOAH2:` authenticated format; legacy AES-CBC files still decrypt. Call `EnableEncryption()` to encrypt an existing plaintext page store, or `RotateEncryptionKey` to change the passphrase.
+
+### CLI & FTS (Phase 7)
+
+Install the global tool (local build):
+
+```bash
+dotnet pack LoahDB.Cli/LoahDB.Cli.csproj -c Release
+dotnet tool install --global loah --add-source ./LoahDB.Cli/bin/Release
+loah --path /data --root production info
+```
+
+Optional full-text indexes: `EnsureFullTextIndex` + `SearchFullText` (token AND queries).
+
+NuGet library package: `dotnet pack LoahDB/LoahDB.csproj -c Release` → `LoahDB` 2.0.0.
 
 ## License
 
